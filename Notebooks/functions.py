@@ -9,7 +9,7 @@ from mne.time_frequency import psd_array_welch
 import mne
 from IPython.display import display
 from scipy.signal import welch
-from scipy.signal import coherence
+from scipy.signal import coherence, csd
 
 
 def compute_stage_epochs(df, stage_label):
@@ -158,9 +158,109 @@ def extract_ecg_per_epoch(ecg_sig_total, ecg_clean_total, epochs, sf, detect_pea
                 rpeaks = None
                 n_peaks = 0
 
-            rows.append({"epoch": i, "t0_s": float(t0), "t1_s": float(t1), "dur_s": float(t1 - t0), "raw_seg": x_raw, "clean_seg": x_clean, "rpeaks": rpeaks, "n_peaks": n_peaks, "ok": True})
+            rows.append({"epoch": i, "t0_s": float(t0), "t1_s": float(t1), "dur_s": float(t1 - t0), "raw_seg": x_raw, "clean_seg": x_clean, "rpeaks": rpeaks, "n_peaks": n_peaks, "hr_mean_bpm": hr_mean, "ok": True})
 
         except Exception as e:
-            rows.append({"epoch": i,  "t0_s": float(t0), "t1_s": float(t1), "dur_s": float(t1 - t0), "raw_seg": x_raw, "clean_seg": x_clean, "rpeaks": None, "n_peaks": 0,  "ok": False, "error": str(e)})
+            rows.append({"epoch": i,  "t0_s": float(t0), "t1_s": float(t1), "dur_s": float(t1 - t0), "raw_seg": x_raw, "clean_seg": x_clean, "rpeaks": None, "n_peaks": 0,"hr_mean_bpm": hr_mean,   "ok": False, "error": str(e)})
 
     return pd.DataFrame(rows)
+
+def hrv_per_epoch(ecg, epochs, sf):
+    rows = []
+    for i, (t0, t1) in enumerate(epochs):
+        a, b = int(t0*sf), int(t1*sf)
+        x = ecg[a:b]
+        try:
+            signals, info = nk.ecg_process(x, sampling_rate=sf)
+            # mean HR from ECG_Rate (bpm)
+            hr_mean = float(np.nanmean(signals["ECG_Rate"]))
+
+            # HRV metrics (time domain) from detected R-peaks
+            hrv = nk.hrv_time(info, sampling_rate=sf).iloc[0].to_dict()
+
+            rows.append({
+                "epoch": i,
+                "start_s": float(t0),
+                "hr_mean_bpm": hr_mean,
+                "rmssd_ms": float(hrv.get("HRV_RMSSD", np.nan)),
+                "sdnn_ms": float(hrv.get("HRV_SDNN", np.nan)),
+                "pnn50_pct": float(hrv.get("HRV_pNN50", np.nan)),
+                "n_beats": int(len(info["ECG_R_Peaks"])) if "ECG_R_Peaks" in info else np.nan,
+                "ok": True
+            })
+        except Exception as e:
+            rows.append({"epoch": i, "start_s": float(t0), "ok": False, "error": str(e)})
+
+    return pd.DataFrame(rows)
+
+def extract_resp_from_ecg(ecg, sf, method="neurokit"):
+    if method == "neurokit":
+        resp = nk.ecg_rsp(ecg, sampling_rate=sf)
+        resp = nk.signal_filter(resp, sampling_rate=sf, lowcut=0.05, highcut=0.7)
+    else:
+        raise ValueError(f"Unsupported method: {method}")
+    return resp
+
+def hpc_metric(ecg, resp, epochs, sf, window_epochs):
+    rows = []
+    fs_cpc = 4  
+    for i in range(0, len(epochs), window_epochs):
+
+        group = epochs[i:i+window_epochs]
+
+        if len(group) < window_epochs:
+            continue  
+
+        t0 = group[0][0]
+        t1 = group[-1][1]
+
+        a, b = int(t0*sf), int(t1*sf)
+        x_ecg = ecg[a:b]
+        x_resp = resp[a:b]
+
+        try:
+             _, info = nk.ecg_peaks(x_ecg, sampling_rate=sf)
+             rpeaks = info["ECG_R_Peaks"]
+
+             rr = np.diff(rpeaks) / sf  # RR intervals in seconds
+             t_rr = np.cumsum(rr)  # Time points of RR intervals
+
+             t_grid = np.arange(t_rr[0], t_rr[-1], 1/fs_cpc)
+             rr_resampled = np.interp(t_grid, t_rr, rr)  # Resample RR intervals to common grid
+            
+
+             t_resp_grid = np.arange(len(x_resp))/sf
+             x_resp_resampled = np.interp(t_grid, t_resp_grid, x_resp)  # Resample Resp to common grid
+
+             nps = min(64, len(rr_resampled))
+
+             f, Cxy = csd(rr_resampled, x_resp_resampled, fs=fs_cpc, nperseg=nps)
+             _, Coh = coherence(rr_resampled, x_resp_resampled, fs=fs_cpc, nperseg=nps)
+
+             CPC = np.abs(Cxy) * Coh
+
+             lf_mask = (f >= 0.01) & (f <= 0.15)
+             hf_mask = (f >= 0.15) & (f <= 0.40)
+             HFC = np.trapezoid(CPC[hf_mask], f[hf_mask])
+             LFC = np.trapezoid(CPC[lf_mask], f[lf_mask])
+             LFC_HFC_ratio = LFC / HFC if HFC > 0 else np.nan
+
+             rows.append({"epoch": i, "HFC": HFC, "LFC": LFC, "LFC/HFC": LFC_HFC_ratio, "ok": True})
+
+        except Exception as e:
+             rows.append({"epoch": i, "start_s": float(t0), "ok": False, "error": str(e)})
+             continue   
+
+    return pd.DataFrame(rows)
+
+def classify_sleep_stable_unstable(hpc_df):
+
+    df = hpc_df.copy()
+
+    df["sleep_stability"] = np.where(df["HFC"] > df["LFC"], "stable", "unstable")
+
+    df.loc[(df["HFC"] == 0) & (df["LFC"] == 0), "sleep_stability"] = "undefined"
+    df.loc[(df["HFC"].isna()) | (df["LFC"].isna()), "sleep_stability"] = "undefined"
+
+    return df
+
