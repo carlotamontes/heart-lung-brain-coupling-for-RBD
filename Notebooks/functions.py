@@ -1,3 +1,4 @@
+from multiprocessing.resource_sharer import stop
 from pathlib import Path
 import pandas as pd
 import mne
@@ -263,4 +264,42 @@ def classify_sleep_stable_unstable(hpc_df):
     df.loc[(df["HFC"].isna()) | (df["LFC"].isna()), "sleep_stability"] = "undefined"
 
     return df
+
+def hep_metric(eeg, ecg, epochs, sf):
+    tmin = -0.2
+    tmax = 0.6
+    rows = []
+    ecg_epochs = extract_ecg_per_epoch(ecg, ecg, epochs, sf, detect_peaks=True) 
+    eeg_data = eeg.get_data()
+
+    for i, (t0, t1) in enumerate(epochs):
+        hep_segments = []
+        epoch_data = ecg_epochs.iloc[i]
+        if epoch_data.empty or not epoch_data["ok"]:
+            continue         
+        
+        if epoch_data["rpeaks"] is None or len(epoch_data["rpeaks"]) < 2:
+            continue
+        
+        for r in epoch_data["rpeaks"]:
+            r_global = r + t0 * sf  # Convert local R-peak to global time index
+            start = int(r_global + tmin * sf)
+            stop  = int(r_global + tmax * sf)
+            x_ecg = ecg[start:stop]
+
+            segment = eeg_data[:, start:stop]
+            hep_segments.append(segment)
+
+        if len(hep_segments) == 0:
+            continue
+
+        hep_epochs = np.array(hep_segments)  
+
+        hep_avg = hep_epochs.mean(axis=0)
+
+        hep_mean_amp = hep_avg.mean()
+ 
+        rows.append({"epoch": i, "hep_mean_amp": float(hep_mean_amp), "n_beats_used": len(hep_epochs), "ok": True})
+
+    return pd.DataFrame(rows)
 
