@@ -35,11 +35,12 @@ def add_epoch_onsets(df, epoch_len):
     return df
 
 def pick_core_channels(raw):
-    core_chs = ["F3-C3", "F4-C4", "ECG1-ECG2"]
+    core_chs = ["F3-C3", "ECG1-ECG2"]
     return raw.copy().pick(core_chs)
 
 def preprocess_eeg(raw, notch_freqs=(50, 100), l_freq=0.3, h_freq=35.0):
     eeg = raw.copy()
+    eeg = eeg.pick("F3-C3")  # pick only the EEG channel for preprocessing
     if notch_freqs is not None:
         # Notch filter at 50 and 100 Hz
         # Remove power line noise
