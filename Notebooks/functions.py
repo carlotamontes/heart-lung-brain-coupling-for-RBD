@@ -9,8 +9,9 @@ import pyedflib
 from mne.time_frequency import psd_array_welch
 import mne
 from IPython.display import display
-from scipy.signal import welch
+from scipy.signal import butter, detrend, freqs, welch
 from scipy.signal import coherence, csd
+from scipy.stats import pearsonr
 
 
 def compute_stage_epochs(df, stage_label):
@@ -218,7 +219,8 @@ def extract_resp_from_ecg(ecg, sf, method="neurokit"):
     # resp : 1D numpy array
     # NeuroKit extracts low-frequency modulation of ECG
     # caused by breathing (respiratory sinus arrhythmia and thoracic impedance effects).
-    resp = nk.ecg_rsp(ecg, sampling_rate=sf)
+    ecg_rate = nk.ecg_rate(ecg, sampling_rate=sf)
+    resp = nk.ecg_rsp(ecg_rate, sampling_rate=sf)
 
     # 0.1–0.4 Hz (6–24 breaths per minute)
     # Remove very slow baseline drift (<0.05 Hz)
@@ -310,35 +312,44 @@ def classify_sleep_stable_unstable(hpc_df):
 
     return df
 
-def hep_metric(eeg, ecg, epochs, sf):
-    # time window around R-peaks for HEP extraction
-    tmin = -0.2
-    tmax = 0.6
-    rows = []
-    # compute rpeaks for each epoch and store in a DataFrame
-    ecg_epochs = extract_ecg_per_epoch(ecg, ecg, epochs, sf, detect_peaks=True) 
+def hep_metric(eeg, epoch, sf, window_s=1.0):
+    # epoch = ecg_R.iloc[1]
+    tmin, tmax = -0.2, 0.5
+
+    t0 = epoch["t0_s"]
+    t1 = epoch["t1_s"]
+    a, b = int(t0 * sf), int(t1 * sf)
+    window_samples = int(window_s * sf)
+
+    # get rpeaks for each epoch and store in a DataFrame
+    rpeaks = epoch["rpeaks"]
+    if rpeaks is None or len(rpeaks) < 2:
+            return None
+    
     # extract full EEG data as numpy array
     eeg_data = eeg.get_data()
+    rpeaks_global = np.array(rpeaks) + a  # relative → global
+    hep_values = []
 
-    for i, (t0, t1) in enumerate(epochs):
-        hep_segments = []
-        epoch_data = ecg_epochs.iloc[i]
-        if epoch_data.empty or not epoch_data["ok"]:
-            continue         
+
+    for start in range(a, b - window_samples + 1, window_samples):
+        end = start + window_samples
+
+        selected_rpeaks = rpeaks_global[(rpeaks_global >= start) & (rpeaks_global < end)]
         
-        if epoch_data["rpeaks"] is None or len(epoch_data["rpeaks"]) < 2:
+        if len(selected_rpeaks) == 0:
+            hep_values.append(np.nan)
             continue
 
+        hep_segments = []
         # r is relative to the epoch start
-        for r in epoch_data["rpeaks"]:
-            r_global = r + t0 * sf  # Convert r to global time index
+        for r in selected_rpeaks:
             # Extract EEG segment around the R-peak
-            start = int(r_global + tmin * sf)
-            stop  = int(r_global + tmax * sf)
-            x_ecg = ecg[start:stop]
+            seg_start = int(r + tmin * sf)
+            seg_stop  = int(r + tmax * sf)
 
-            segment = eeg_data[:, start:stop] # (n_channels, window_length_samples)
-
+            segment = eeg_data[:, seg_start:seg_stop] # shape (1, segment_samples)
+            segment = detrend(segment, axis=1)  # axis=1 = along time
             hep_segments.append(segment)
 
         if len(hep_segments) == 0:
@@ -346,43 +357,125 @@ def hep_metric(eeg, ecg, epochs, sf):
 
         hep_epochs = np.array(hep_segments)  
 
+        # Baseline correction
+        r_idx    = int(abs(tmin) * sf)          # sample index of R-peak (t=0)
+        bl_start = int(r_idx + (-0.150 * sf))         # -150ms antes do R-peak
+        bl_end   = int(r_idx + (-0.050 * sf))         # -50ms antes do R-peak
+        baseline = hep_epochs[:, :, bl_start:bl_end].mean(axis=2, keepdims=True)
+        hep_epochs = hep_epochs - baseline
+
+        # hep_epochs shape (n_beats, n_channels, segment_samples)
+
+        hep_epochs = mne.filter.filter_data(hep_epochs, sfreq=sf, l_freq=None, h_freq=30.0, verbose=False)
+
         hep_avg = hep_epochs.mean(axis=0) # (n_channels, window_samples)
-
-        hep_mean_amp = hep_avg.mean()
  
-        rows.append({"epoch": i, "hep_mean_amp": float(hep_mean_amp), "n_beats_used": len(hep_epochs), "ok": True})
+        hep_values.append(float(hep_avg.mean()) * 1e6)
 
-    return pd.DataFrame(rows)
+    return hep_values
 
-def HEP_Delta_plot_selected(hep_df, eeg_band_df, epoch_indices):
+def delta_power_1s(eeg_filtered, epoch, sf, window_frequency=1.0):
+    delta_vals  = []
+    window_samples = int(window_frequency * sf)
+    t0, t1 = epoch
+    a, b = int(t0 * sf), int(t1 * sf)
 
-    merged = pd.merge(hep_df, eeg_band_df, on="epoch")
-    merged = merged[merged["epoch"].isin(epoch_indices)]
-    merged = merged.sort_values("start_s").reset_index(drop=True)
+    epoch_signal = eeg_filtered.get_data(start=a, stop=b)[0]
 
-    x = (merged["start_s"] - merged["start_s"].iloc[0]) / 60
+    for start in range(0, (b - a) - window_samples + 1, window_samples):
+        end = start + window_samples
+        segment = epoch_signal[start:end]
 
-    fig, ax1 = plt.subplots(figsize=(8,4))
+        # Compute PSD for the 1-second segment
+        # expects (n_channels, n_samples)
+        #epoch_signal is 1D array (nsamples)
 
-    ax1.plot(x,
-             merged["hep_mean_amp"],
-             color="blue",
-             marker="o")
+        psd, freqs = psd_array_welch(segment[None, :], sfreq=sf, fmin=0.5, fmax=4.0, verbose=False)
 
-    ax1.set_xlabel("Time (minutes)")
+        # Integrate PSD over the delta band (0.5–4 Hz) to get delta power
+        delta_vals.append(float(np.trapezoid(psd[0], freqs)) * 1e12)
+    return delta_vals
+
+def HEP_Delta_plot_selected(hep_values, delta_vals, epoch):
+    t = np.arange(len(delta_vals))
+
+    fig, ax1 = plt.subplots(figsize=(10,4))
+
+    ax1.plot(t, hep_values, color="blue", marker="o")
+    ax1.set_xlabel("Time within epoch (s)")
     ax1.set_ylabel("HEP Mean Amplitude (µV)", color="blue")
     ax1.tick_params(axis='y', labelcolor="blue")
 
     ax2 = ax1.twinx()
-    ax2.plot(x,
-             merged["delta_power"],
-             color="red",
-             marker="o")
-
+    ax2.plot(t, delta_vals, color="red", marker="o")
     ax2.set_ylabel("Delta Power (µV²)", color="red")
     ax2.tick_params(axis='y', labelcolor="red")
 
-    plt.title(f"HEP and Delta (Epochs {epoch_indices})")
+    plt.title(f"HEP and Delta — epoch {epoch['t0_s']:.0f}s to {epoch['t1_s']:.0f}s")
     plt.grid(True)
     plt.tight_layout()
     plt.show()
+
+
+def HEP_Delta_plot_range(eeg_filtered, ecg_R, rem_epochs, epoch_indices, sf):
+    all_hep    = []
+    all_delta  = []
+    all_hr     = []
+
+    for i in epoch_indices:
+        hep   = hep_metric(eeg_filtered, epoch=ecg_R.iloc[i], sf=sf)
+        delta = delta_power_1s(eeg_filtered, epoch=rem_epochs[i], sf=sf)
+        hr    = ecg_R.iloc[i]["hr_mean_bpm"]  # single HR value per epoch
+
+        all_hep.extend(hep)
+        all_delta.extend(delta)
+        all_hr.extend([hr] * 30)  # repeat HR for each of the 30 seconds
+
+    t = np.arange(len(all_delta))  # seconds
+
+    fig, ax1 = plt.subplots(figsize=(14, 5))
+
+    ax1.plot(t, np.array(all_hep, dtype=float), color="blue", marker="o", markersize=3, label="HEP")
+    ax1.set_xlabel("Time (s)")
+    ax1.set_ylabel("HEP Mean Amplitude (µV)", color="blue")
+    ax1.tick_params(axis='y', labelcolor="blue")
+
+    ax2 = ax1.twinx()
+    ax2.plot(t, all_delta, color="red", marker="o", markersize=3, label="Delta Power")
+    ax2.set_ylabel("Delta Power (µV²)", color="red")
+    ax2.tick_params(axis='y', labelcolor="red")
+
+    ax3 = ax1.twinx()
+    ax3.spines["right"].set_position(("axes", 1.08))  # offset third axis
+    ax3.plot(t, all_hr, color="green", marker="o", markersize=3, linestyle="--", label="HR")
+    ax3.set_ylabel("Heart Rate (bpm)", color="green")
+    ax3.tick_params(axis='y', labelcolor="green")
+
+    # epoch boundaries
+    for i in range(1, len(epoch_indices)):
+        ax1.axvline(x=i*30, color='gray', linestyle='--', alpha=0.5)
+
+    plt.title(f"HEP, Delta Power and HR — epochs {epoch_indices[0]} to {epoch_indices[-1]}")
+    plt.tight_layout()
+    plt.show()
+
+# Correlation between HEP and Delta Power across epochs
+# using pearson correlation coefficient
+def plot_hep_delta_correlation(hep_values, delta_vals):
+    hep   = np.array(hep_values, dtype=float)
+    delta = np.array(delta_vals, dtype=float)
+
+    # remove nan pairs
+    mask  = ~np.isnan(hep) & ~np.isnan(delta)
+    hep_clean   = hep[mask]
+    delta_clean = delta[mask]
+
+    if len(hep_clean) < 3:
+        print("Not enough valid values to correlate")
+        return None
+
+    r_pearson,  p_pearson  = pearsonr(hep_clean, delta_clean)
+
+    print(f"Pearson:  r={r_pearson:.3f},  p={p_pearson:.3f}")
+
+    return {"pearson_r": r_pearson, "pearson_p": p_pearson}
