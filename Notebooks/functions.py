@@ -36,12 +36,12 @@ def add_epoch_onsets(df, epoch_len):
     return df
 
 def pick_core_channels(raw):
-    core_chs = ["F3-C3", "ECG1-ECG2"]
+    core_chs = ["F4-C4", "ECG1-ECG2"]
     return raw.copy().pick(core_chs)
 
 def preprocess_eeg(raw, notch_freqs=(50, 100), l_freq=0.3, h_freq=35.0):
     eeg = raw.copy()
-    eeg = eeg.pick("F3-C3")  # pick only the EEG channel for preprocessing
+    eeg = eeg.pick("F4-C4")  # pick only the EEG channel for preprocessing
     if notch_freqs is not None:
         # Notch filter at 50 and 100 Hz
         # Remove power line noise
@@ -133,7 +133,7 @@ def eeg_bandpower_per_epoch(eeg_filtered, epochs, sf):
         # epochs -> [(t0, t1), (t0, t1), ...]
         a, b = int(t0*sf), int(t1*sf)
         # MNE raw object (filtered) -> numpy array for the epoch
-        X = eeg_filtered.get_data(start=a, stop=b) 
+        X = eeg_filtered[a:b]
 
         psd, freqs = psd_array_welch(X, sfreq=sf, fmin=0.5, fmax=40, verbose=False)
 
@@ -312,7 +312,7 @@ def classify_sleep_stable_unstable(hpc_df):
 
     return df
 
-def hep_metric(eeg, epoch, sf, window_s=1.0):
+def hep_metric(eeg_filtered, epoch, sf, window_s=1.0):
     # epoch = ecg_R.iloc[1]
     tmin, tmax = -0.2, 0.5
 
@@ -327,7 +327,6 @@ def hep_metric(eeg, epoch, sf, window_s=1.0):
             return None
     
     # extract full EEG data as numpy array
-    eeg_data = eeg.get_data()
     rpeaks_global = np.array(rpeaks) + a  # relative → global
     hep_values = []
 
@@ -348,7 +347,10 @@ def hep_metric(eeg, epoch, sf, window_s=1.0):
             seg_start = int(r + tmin * sf)
             seg_stop  = int(r + tmax * sf)
 
-            segment = eeg_data[:, seg_start:seg_stop] # shape (1, segment_samples)
+            if seg_start < 0 or seg_stop > len(eeg_filtered):
+                continue
+
+            segment = eeg_filtered[seg_start:seg_stop][None, :] # shape (1, segment_samples)
             segment = detrend(segment, axis=1)  # axis=1 = along time
             hep_segments.append(segment)
 
@@ -380,7 +382,7 @@ def delta_power_1s(eeg_filtered, epoch, sf, window_frequency=1.0):
     t0, t1 = epoch
     a, b = int(t0 * sf), int(t1 * sf)
 
-    epoch_signal = eeg_filtered.get_data(start=a, stop=b)[0]
+    epoch_signal = eeg_filtered[a:b]
 
     for start in range(0, (b - a) - window_samples + 1, window_samples):
         end = start + window_samples
