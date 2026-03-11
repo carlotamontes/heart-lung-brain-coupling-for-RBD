@@ -41,7 +41,7 @@ def pick_core_channels(raw):
 
 def preprocess_eeg(raw, notch_freqs=(50, 100), l_freq=0.3, h_freq=35.0):
     eeg = raw.copy()
-    eeg = eeg.pick("F4-C4")  # pick only the EEG channel for preprocessing
+    eeg = eeg.pick(["F4-C4"])  # pick only the EEG channel for preprocessing
     if notch_freqs is not None:
         # Notch filter at 50 and 100 Hz
         # Remove power line noise
@@ -50,7 +50,7 @@ def preprocess_eeg(raw, notch_freqs=(50, 100), l_freq=0.3, h_freq=35.0):
     #Bandpass 0.3–35 Hz
     eeg.filter(l_freq=l_freq, h_freq=h_freq, verbose=False)
 
-    return eeg
+    return eeg.get_data()[0] # return 1D array of the EEG channel
 
 def preprocess_ecg(raw, method="neurokit", lowcut=0.5, highcut=45):
     sf = raw.info["sfreq"] # sampling frequency
@@ -60,9 +60,9 @@ def preprocess_ecg(raw, method="neurokit", lowcut=0.5, highcut=45):
     # Bandpass 0.5–45 Hz
     ecg_clean = nk.ecg_clean(ecg, sampling_rate=sf, method=method, lowcut=lowcut, highcut=highcut)
 
-    return ecg_clean
+    return ecg_clean # return 1D array of the cleaned ECG signal
 
-def compute_psd(raw, fmin=0.5, fmax=40,  n_per_seg=2048, n_fft=4096,  n_overlap=1024):
+def compute_psd(eeg_filtered, sf, fmin=0.5, fmax=40,  n_per_seg=2048, n_fft=4096,  n_overlap=1024):
 
     # n_per_seg: Length of each segment for Welch's method 
     # window length = 2048 / 512 = 4.0 seconds
@@ -77,90 +77,82 @@ def compute_psd(raw, fmin=0.5, fmax=40,  n_per_seg=2048, n_fft=4096,  n_overlap=
     # n_overlap: Number of points to overlap between segments 
     # overlap = 1024 / 512 = 2.0 seconds
 
-    X = raw.get_data() # shape (n_channels, n_samples)
-    sf = raw.info["sfreq"] 
-
     # psd shape (n_channels, n_freqs)
     # freqs shape (n_freqs,)
 
-    psd, freqs = psd_array_welch(X, sfreq=sf, fmin=fmin, fmax=fmax, n_per_seg=n_per_seg,n_fft=n_fft, n_overlap=n_overlap, verbose=False)
+    psd, freqs = psd_array_welch(eeg_filtered[np.newaxis, :], sfreq=sf, fmin=fmin, fmax=fmax, n_per_seg=n_per_seg,n_fft=n_fft, n_overlap=n_overlap, verbose=False)
     # psd is in V^2 / Hz
     # V^2 / Hz -> µV^2 / Hz by multiplying by 1e12
     psd = psd * 1e12
     
     return psd, freqs
 
-def summarize_psd(raw_data, filtered_data, ch_names):
-    for i in (range(len(ch_names))):
-        # mean and std of PSD across frequencies for each channel - RAW
-        raw_mean = raw_data[i].mean()
-        raw_std = raw_data[i].std()
+def summarize_psd(raw_data, filtered_data):
+    # mean and std of PSD across frequencies for each channel - RAW
+    raw_mean = raw_data.mean()
+    raw_std = raw_data.std()
 
-        # mean and std of PSD across frequencies for each channel - CLEANED
-        filt_mean = filtered_data[i].mean()
-        filt_std = filtered_data[i].std()
+    # mean and std of PSD across frequencies for each channel - CLEANED
+    filt_mean = filtered_data.mean()
+    filt_std = filtered_data.std()
 
-        print(f"{ch_names[i]}: {raw_mean:.2e} ± {raw_std:.2e} µV²/Hz")
-        print(f"{ch_names[i]}: {filt_mean:.2e} ± {filt_std:.2e} µV²/Hz")
-        # if std is much smaller than mean -> more stable 
-        # if std is large compared to mean ->  more variability 
+    print(f"RAW: {raw_mean:.2e} ± {raw_std:.2e} µV²/Hz")
+    print(f"FILTERED: {filt_mean:.2e} ± {filt_std:.2e} µV²/Hz")
+    # if std is much smaller than mean -> more stable 
+    # if std is large compared to mean ->  more variability 
 
-def plot_psd_comparison(freqs, psd_raw, psd_filt, ch_names):
+def eeg_bandpower(eeg_filtered, stage_epochs_dict, sf):
+    bands = {"delta": (0.5, 4), "theta": (4, 8), "alpha": (8, 12), "beta": (12, 30), "gamma": (30, 40)}
+    rows = []
 
-    plt.figure(figsize=(10,5))
+    for stage_name, epochs_list in stage_epochs_dict.items():
+        for i, (t0, t1) in enumerate(epochs_list):
+            a, b = int(t0 * sf), int(t1 * sf)
+            X = eeg_filtered[a:b]
+            
+            # Cálculo do PSD
+            psd, freqs = psd_array_welch(X[np.newaxis, :], sfreq=sf, fmin=0.5, fmax=40, verbose=False)
+            
+            row = {"stage": stage_name, "epoch": i, "start_s": float(t0)}
+            bp = {}
+            for name, (f1, f2) in bands.items():
+                idx = (freqs >= f1) & (freqs <= f2)
+                # Integração para obter a potência
+                val = float(np.trapezoid(psd[:, idx], freqs[idx], axis=1).mean())
+                bp[name] = val
+                row[f"{name}_power"] = val
+            
+            total_power = sum(bp.values())
+            row["delta_relative"] = bp["delta"] / total_power if total_power > 0 else np.nan
+            rows.append(row) # Adiciona o dicionário à lista
+            
+    # CRÍTICO: O DataFrame é criado aqui, fora de todos os loops!
+    return pd.DataFrame(rows)
 
-    for i, ch in enumerate(ch_names):
+def plot_psd_comparison(eeg_filtered, sf):
 
-        # plotting PSD on a log scale to better visualize differences across frequencies
-        plt.semilogy(freqs, psd_raw[i], linestyle="--", linewidth=1, alpha=0.7, label=f"{ch} RAW")
+    psd, freqs = psd_array_welch(eeg_filtered[np.newaxis, :], sfreq=sf, fmin=0.5, fmax=40, verbose=False)
+    psd = psd[0]
 
-        plt.semilogy(freqs, psd_filt[i], linewidth=1, alpha=0.7, label=f"{ch} FILTERED")
+    bands = {"Delta": (0.5, 4, "blue"), "Theta": (4, 8, "green"), "Alpha": (8, 12, "red"), "Beta": (12, 30, "orange"), "Gamma": (30, 40, "purple")}
 
+    plt.figure(figsize=(12, 5))
+
+    plt.semilogy(freqs, psd, color='black', linewidth=2, label='Total PSD')
+
+    for name, (fmin, fmax, color) in bands.items():
+        idx = (freqs >= fmin) & (freqs <= fmax)
+        plt.fill_between(freqs[idx], psd[idx], color=color, alpha=0.3, label=name)
+
+    plt.title("EEG Power Spectral Density por Bandas (Sinal Total)")
     plt.xlabel("Frequency (Hz)")
     plt.ylabel("PSD (µV²/Hz)")
-    plt.title("EEG PSD Comparison")
     plt.xlim(0.5, 40)
+    plt.grid(True, which="both", ls="-", alpha=0.2)
     plt.legend()
     plt.show()
 
-def eeg_bandpower_per_epoch(eeg_filtered, epochs, sf):
-    # Define frequency bands of interest
-    bands = { "delta": (0.5, 4), "theta": (4, 8), "alpha": (8, 12), "beta":  (12, 30), "gamma": (30, 40) }
-    
-    rows = []
 
-    for i, (t0, t1) in enumerate(epochs):
-        # epochs -> [(t0, t1), (t0, t1), ...]
-        a, b = int(t0*sf), int(t1*sf)
-        # MNE raw object (filtered) -> numpy array for the epoch
-        X = eeg_filtered[a:b]
-
-        psd, freqs = psd_array_welch(X, sfreq=sf, fmin=0.5, fmax=40, verbose=False)
-
-        row = {"epoch": i, "start_s": float(t0)}
-
-        for name, (f1, f2) in bands.items():
-            idx = (freqs >= f1) & (freqs <= f2)
-            # Integrate PSD over the band using the trapezoidal rule to get band power
-            bp_ch = np.trapezoid(psd[:, idx], freqs[idx], axis=1)  
-            row[f"{name}_power"] = float(bp_ch.mean())      
-        rows.append(row) 
-        # Data Frame -> epoch index , start time, delta power, theta power, alpha power, beta power, gamma power
-
-    return pd.DataFrame(rows)
-
-def eeg_bandpower_all_stages(raw, stage_epochs_dict, sf):
-    dfs = []
-    for stage, epochs in stage_epochs_dict.items():
-        # ("N2", [(t0,t1), (t0,t1)]) ("REM", [(t0,t1)]) ("N3", [])
-        if len(epochs) == 0:
-            continue
-        # For each stage, compute bandpower per epoch and add a column for the stage label
-        tmp = eeg_bandpower_per_epoch(raw, epochs, sf)
-        tmp["stage"] = stage
-        dfs.append(tmp)
-
-    return pd.concat(dfs, ignore_index=True)
 
 def extract_ecg_per_epoch(ecg_sig_total, ecg_clean_total, epochs, sf, detect_peaks=True):
     rows = []
@@ -198,8 +190,8 @@ def hrv_per_epoch(ecg, epochs, sf):
     rows = []
     for i, (t0, t1) in enumerate(epochs):
         a, b = int(t0*sf), int(t1*sf)
-        x = ecg[a:b]
-        try:
+        x = ecg[a:b] * 1000 # convert to mV for better numerical stability in HRV calculations
+        try: 
             # Process the ECG segment to extract HRV metrics using NeuroKit2
             signals, info = nk.ecg_process(x, sampling_rate=sf)
             # mean HR from ECG_Rate (bpm)
@@ -226,6 +218,9 @@ def extract_resp_from_ecg(ecg, sf, method="neurokit"):
     # Remove very slow baseline drift (<0.05 Hz)
     # Remove high-frequency noise (>0.7 Hz)
     resp = nk.signal_filter(resp, sampling_rate=sf, lowcut=0.05, highcut=0.7)
+    
+    resp = (resp - np.mean(resp)) / np.std(resp)
+
     return resp
 
 def hpc_metric(ecg, resp, epochs, sf, window_epochs):
@@ -249,7 +244,7 @@ def hpc_metric(ecg, resp, epochs, sf, window_epochs):
 
         a, b = int(t0*sf), int(t1*sf)
 
-        x_ecg = ecg[a:b]
+        x_ecg = ecg[a:b] * 1000 # convert to mV for better numerical stability in HRV calculations
         x_resp = resp[a:b]
 
         try:
@@ -286,8 +281,8 @@ def hpc_metric(ecg, resp, epochs, sf, window_epochs):
 
              lf_mask = (f >= 0.01) & (f <= 0.15)
              hf_mask = (f >= 0.15) & (f <= 0.40)
-             HFC = np.trapezoid(CPC[hf_mask], f[hf_mask])
-             LFC = np.trapezoid(CPC[lf_mask], f[lf_mask])
+             HFC = np.trapezoid(CPC[hf_mask], f[hf_mask]) * 1e6  # convert to µV²
+             LFC = np.trapezoid(CPC[lf_mask], f[lf_mask]) * 1e6  # convert to µV²
              LFC_HFC_ratio = LFC / HFC if HFC > 0 else np.nan
 
              rows.append({"epoch": i, "HFC": HFC, "LFC": LFC, "LFC/HFC": LFC_HFC_ratio, "ok": True})
@@ -311,6 +306,7 @@ def classify_sleep_stable_unstable(hpc_df):
     df.loc[(df["HFC"].isna()) | (df["LFC"].isna()), "sleep_stability"] = "undefined"
 
     return df
+
 
 def hep_metric(eeg_filtered, epoch, sf, window_s=1.0):
     # epoch = ecg_R.iloc[1]
@@ -382,20 +378,41 @@ def delta_power_1s(eeg_filtered, epoch, sf, window_frequency=1.0):
     t0, t1 = epoch
     a, b = int(t0 * sf), int(t1 * sf)
 
+    if a < 0 or b > len(eeg_filtered) or a >= b:
+        return None
+
+    bands = {"delta": (0.5, 4), "theta": (4, 8), "alpha": (8, 12), "beta": (12, 30), "gamma": (30, 40)}
+
     epoch_signal = eeg_filtered[a:b]
 
     for start in range(0, (b - a) - window_samples + 1, window_samples):
         end = start + window_samples
         segment = epoch_signal[start:end]
 
-        # Compute PSD for the 1-second segment
-        # expects (n_channels, n_samples)
-        #epoch_signal is 1D array (nsamples)
+        if segment.size < window_samples:
+            continue
 
-        psd, freqs = psd_array_welch(segment[None, :], sfreq=sf, fmin=0.5, fmax=4.0, verbose=False)
+        try:
+            # Compute PSD for the 1-second segment
+            # expects (n_channels, n_samples)
+            #epoch_signal is 1D array (nsamples)
 
-        # Integrate PSD over the delta band (0.5–4 Hz) to get delta power
-        delta_vals.append(float(np.trapezoid(psd[0], freqs)) * 1e12)
+            # relative delta power = delta power / total power
+            psd, freqs = psd_array_welch(segment[None, :], sfreq=sf, fmin=0.5, fmax=40.0, verbose=False)
+            psd_seg = psd[0]
+
+            powers = {}
+            for name, (f1, f2) in bands.items():
+                idx = (freqs >= f1) & (freqs <= f2)
+
+                powers[name] = float(np.trapezoid(psd_seg[idx], freqs[idx])) if np.any(idx) else 0.0
+            
+            total_power = sum(powers.values())
+            rel_delta = powers["delta"] / total_power if total_power > 0 else 0.0
+            
+            delta_vals.append(rel_delta)
+        except Exception:
+            continue
     return delta_vals
 
 def HEP_Delta_plot_selected(hep_values, delta_vals, epoch):
