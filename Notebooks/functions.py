@@ -211,7 +211,10 @@ def extract_resp_from_ecg(ecg, sf, method="neurokit"):
     # resp : 1D numpy array
     # NeuroKit extracts low-frequency modulation of ECG
     # caused by breathing (respiratory sinus arrhythmia and thoracic impedance effects).
-    ecg_rate = nk.ecg_rate(ecg, sampling_rate=sf)
+    peaks, info = nk.ecg_peaks(ecg, sampling_rate=sf)
+
+    ecg_rate = nk.ecg_rate(peaks, sampling_rate=sf, desired_length=len(ecg))
+
     resp = nk.ecg_rsp(ecg_rate, sampling_rate=sf)
 
     # 0.1–0.4 Hz (6–24 breaths per minute)
@@ -219,7 +222,7 @@ def extract_resp_from_ecg(ecg, sf, method="neurokit"):
     # Remove high-frequency noise (>0.7 Hz)
     resp = nk.signal_filter(resp, sampling_rate=sf, lowcut=0.05, highcut=0.7)
     
-    resp = (resp - np.mean(resp)) / np.std(resp)
+    # resp = (resp - np.mean(resp)) / np.std(resp)
 
     return resp
 
