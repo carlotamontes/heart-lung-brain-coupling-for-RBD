@@ -311,13 +311,14 @@ def classify_sleep_stable_unstable(hpc_df):
     return df
 
 
-def hep_metric(eeg_filtered, epoch, sf, window_s=1.0):
+def hep_metric(eeg_filtered, epoch, sf, window_s=1.0, min_rr_s=0.88, amplitude_threshold_uv=100.0):
     # epoch = ecg_R.iloc[1]
-    tmin, tmax = -0.2, 0.5
+    tmin, tmax = -0.2, 0.6
 
     t0 = epoch["t0_s"]
     t1 = epoch["t1_s"]
-    a, b = int(t0 * sf), int(t1 * sf)
+    # Convert epoch start and end times from seconds to sample indices
+    a, b = int(t0 * sf), int(t1 * sf) 
     window_samples = int(window_s * sf)
 
     # get rpeaks for each epoch and store in a DataFrame
@@ -327,53 +328,113 @@ def hep_metric(eeg_filtered, epoch, sf, window_s=1.0):
     
     # extract full EEG data as numpy array
     rpeaks_global = np.array(rpeaks) + a  # relative → global
-    hep_values = []
+    # = [100+7200, 450+7200, 800+7200]   (se sf=120 e t0=60s → a=7200)
+    # = [7300, 7650, 8000]  ← posição real no sinal EEG completo
 
+    hep_values_scalar = [] 
+    
+    hep_values_waveform = []
 
+    rr_intervals = np.diff(rpeaks_global)  # em amostras
+    
+    min_rr_samples = int(min_rr_s * sf)
+    # define a minimum RR interval in samples to avoid overlapping heartbeats
+    
+    amplitude_threshold = amplitude_threshold_uv * 1e-6  # µV → V
+    # define an amplitude threshold to exclude artifacts
+
+    # iterate over 1-second windows within the epoch
     for start in range(a, b - window_samples + 1, window_samples):
         end = start + window_samples
+        # blocks of 1s that do not overlap: [a, a+window_samples), [a+window_samples, a+2*window_samples), ...
+        #  [7200, 7328), [7328, 7456), [7456, 7584)
 
+        # select only Rpeaks that fall in that window 
         selected_rpeaks = rpeaks_global[(rpeaks_global >= start) & (rpeaks_global < end)]
         
+        # If no R-peaks are found in the window, we can skip or assign NaN
         if len(selected_rpeaks) == 0:
-            hep_values.append(np.nan)
+            hep_values_scalar.append(np.nan)
+            hep_values_waveform.append(None)
             continue
-
-        hep_segments = []
+        
+        # create hep segments for each Rpeak from -200 to +500 ms around the Rpeak
+        hep_segments = [] # shape (1, 700)
+    
         # r is relative to the epoch start
+        # r is the global sample index 
+        # is the position of the R peak in the full EEG signal (not just the epoch)
         for r in selected_rpeaks:
             # Extract EEG segment around the R-peak
-            seg_start = int(r + tmin * sf)
-            seg_stop  = int(r + tmax * sf)
+
+            seg_start = int(r + tmin * sf) # r - 200ms
+            seg_stop  = int(r + tmax * sf) # r + 500ms
+
+            # r is the center of the extracted segment
+            # it's the exact sample in eeg_filtered where the heartbeat occurred 
+            # seg_start and seg_stop define the time window around the R-peak
 
             if seg_start < 0 or seg_stop > len(eeg_filtered):
                 continue
+            # if the rpeak is out of the bounds of the whole EEG signal, skip it
 
+            r_idx_global = np.where(rpeaks_global == r)[0] 
+            # find the index of the R-peak in the global list of R-peaks for the epoch
+            if len(r_idx_global) > 0:
+                r_idx_global = r_idx_global[0] 
+                if r_idx_global < len(rr_intervals):
+                    if rr_intervals[r_idx_global] < min_rr_samples: 
+                        # if the RR interval after this R-peak is too short, skip it
+                        continue  
+
+            # extract the segment of the EEG of -200 ms to +500 ms
             segment = eeg_filtered[seg_start:seg_stop][None, :] # shape (1, segment_samples)
+            
+            # amplitude check to exclude artifacts
+            if np.max(np.abs(segment)) > amplitude_threshold:
+                continue
+
+            # remove linear trends that could bias the average
             segment = detrend(segment, axis=1)  # axis=1 = along time
+            
+            # append the segments 
+            # (1, 700) → (n_beats, 700) 
             hep_segments.append(segment)
 
+        # if all rpeaks on the 1s window are discarded then discard all window 
         if len(hep_segments) == 0:
+            hep_values_scalar.append(np.nan)
+            hep_values_waveform.append(None)
             continue
 
         hep_epochs = np.array(hep_segments)  
+        # shape (n_beats, 1, segment_samples) → (n_beats, segment_samples)
 
-        # Baseline correction
-        r_idx    = int(abs(tmin) * sf)          # sample index of R-peak (t=0)
-        bl_start = int(r_idx + (-0.150 * sf))         # -150ms antes do R-peak
-        bl_end   = int(r_idx + (-0.050 * sf))         # -50ms antes do R-peak
-        baseline = hep_epochs[:, :, bl_start:bl_end].mean(axis=2, keepdims=True)
+        # Baseline corrections (-200ms a 0ms, modal value do paper)
+        r_idx    = int(abs(tmin) * sf)           # posição do R-peak no segmento
+        bl_start = 0                             # -200ms (início do segmento)
+        bl_end   = r_idx                         # 0ms (R-peak)
+        # baseline shape (n_beats, 1, 1) → (n_beats, 1, segment_samples)
+        baseline = hep_epochs[:, :, bl_start:bl_end].mean(axis=2, keepdims=True) 
+        # baseline is the mean amplitude in the -200 to 0 ms window for each beat, used to correct for slow drifts in the EEG signal
         hep_epochs = hep_epochs - baseline
 
-        # hep_epochs shape (n_beats, n_channels, segment_samples)
 
-        hep_epochs = mne.filter.filter_data(hep_epochs, sfreq=sf, l_freq=None, h_freq=30.0, verbose=False)
+        # (3, 1, 700) → (1, 700)
+        # (n_beats, 1, n_samples) → (1, n_samples) → (n_samples,)
+        # average of the EEG amplitude across beats to get the HEP for that 1-second window
+        hep_avg = hep_epochs.mean(axis=0).squeeze()  # shape: (n_samples,)
 
-        hep_avg = hep_epochs.mean(axis=0) # (n_channels, window_samples)
- 
-        hep_values.append(float(hep_avg.mean()) * 1e6)
+        hep_values_waveform.append(hep_avg) # shape (n_samples,) = (700,)
 
-    return hep_values
+        # mean amplitude of the HEP in the -200 to +500 ms window 
+        hep_values_scalar.append(float(hep_avg.mean()) * 1e6)
+
+    return {
+        "scalar": hep_values_scalar,    # lista de floats (µV)
+        "waveform": hep_values_waveform # lista de arrays (700,)
+    }
+
 
 def delta_power_1s(eeg_filtered, epoch, sf, window_frequency=1.0):
     delta_vals  = []
@@ -478,6 +539,48 @@ def HEP_Delta_plot_range(eeg_filtered, ecg_R, rem_epochs, epoch_indices, sf):
         ax1.axvline(x=i*30, color='gray', linestyle='--', alpha=0.5)
 
     plt.title(f"HEP, Delta Power and HR — epochs {epoch_indices[0]} to {epoch_indices[-1]}")
+    plt.tight_layout()
+    plt.show()
+
+
+def HEP_waveform_plot(hep_result, epoch, sf, tmin=-0.2, tmax=0.5):
+    waveforms = [w for w in hep_result["waveform"] if w is not None]
+    
+    if len(waveforms) == 0:
+        print("No valid waveforms to plot.")
+        return
+
+    # time axis in ms
+    n_samples = waveforms[0].shape[0]
+    time_ms = np.linspace(tmin * 1000, tmax * 1000, n_samples)
+
+    grand_avg = np.mean(waveforms, axis=0) * 1e6  # → µV
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+
+    # plot each 1s window waveform in light grey
+    for w in waveforms:
+        ax.plot(time_ms, w * 1e6, color="grey", alpha=0.3, linewidth=0.8)
+
+    # plot grand average on top
+    ax.plot(time_ms, grand_avg, color="blue", linewidth=2, label=f"Grand avg (n={len(waveforms)})")
+
+    # mark R-peak
+    ax.axvline(x=0, color="red", linestyle="--", linewidth=1, label="R-peak")
+
+    # mark baseline window
+    ax.axvspan(-200, 0, alpha=0.05, color="green", label="Baseline (-200ms to 0ms)")
+
+    # mark typical HEP window (200-600ms)
+    ax.axvspan(200, 500, alpha=0.05, color="blue", label="HEP window (200-500ms)")
+
+    ax.set_xlabel("Time relative to R-peak (ms)")
+    ax.set_ylabel("Amplitude (µV)")
+    ax.set_title(f"HEP Waveform — epoch {epoch['t0_s']:.0f}s to {epoch['t1_s']:.0f}s")
+    ax.legend(loc="upper right")
+    ax.grid(True, alpha=0.3)
+    ax.axhline(y=0, color="black", linewidth=0.5)
+
     plt.tight_layout()
     plt.show()
 
