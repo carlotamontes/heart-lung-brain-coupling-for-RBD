@@ -480,6 +480,7 @@ def delta_power_1s(eeg_filtered, epoch, sf, window_frequency=1.0):
     return delta_vals
 
 def HEP_Delta_plot_selected(hep_values, delta_vals, epoch):
+    hep_values = hep_values["scalar"] 
     t = np.arange(len(delta_vals))
 
     fig, ax1 = plt.subplots(figsize=(10,4))
@@ -507,6 +508,7 @@ def HEP_Delta_plot_range(eeg_filtered, ecg_R, rem_epochs, epoch_indices, sf):
 
     for i in epoch_indices:
         hep   = hep_metric(eeg_filtered, epoch=ecg_R.iloc[i], sf=sf)
+        hep = hep["scalar"] 
         delta = delta_power_1s(eeg_filtered, epoch=rem_epochs[i], sf=sf)
         hr    = ecg_R.iloc[i]["hr_mean_bpm"]  # single HR value per epoch
 
