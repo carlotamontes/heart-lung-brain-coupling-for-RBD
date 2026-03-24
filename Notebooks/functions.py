@@ -11,7 +11,7 @@ import mne
 from IPython.display import display
 from scipy.signal import butter, detrend, freqs, welch
 from scipy.signal import coherence, csd
-from scipy.stats import pearsonr
+from scipy.stats import pearsonr, spearmanr
 
 
 def compute_stage_epochs(df, stage_label):
@@ -101,14 +101,25 @@ def summarize_psd(raw_data, filtered_data):
     # if std is much smaller than mean -> more stable 
     # if std is large compared to mean ->  more variability 
 
-def eeg_bandpower(eeg_filtered, stage_epochs_dict, sf):
+def eeg_bandpower(eeg_filtered, stage_epochs_dict, sf, min_epoch_s=2.0):
     bands = {"delta": (0.5, 4), "theta": (4, 8), "alpha": (8, 12), "beta": (12, 30), "gamma": (30, 40)}
     rows = []
+    n = len(eeg_filtered)
+    min_samples = int(min_epoch_s * sf)
+
 
     for stage_name, epochs_list in stage_epochs_dict.items():
         for i, (t0, t1) in enumerate(epochs_list):
             a, b = int(t0 * sf), int(t1 * sf)
+            a, b = max(0, a), min(n, b)  # ensure indices are within bounds
+
+            if b - a < min_samples:
+                continue  # skip epochs that are too short for reliable PSD estimation
+
             X = eeg_filtered[a:b]
+
+            if np.all(X == 0):
+                continue  # skip epochs with no signal (e.g., due to artifacts or missing data)
             
             # Cálculo do PSD
             psd, freqs = psd_array_welch(X[np.newaxis, :], sfreq=sf, fmin=0.5, fmax=40, verbose=False)
@@ -117,16 +128,14 @@ def eeg_bandpower(eeg_filtered, stage_epochs_dict, sf):
             bp = {}
             for name, (f1, f2) in bands.items():
                 idx = (freqs >= f1) & (freqs <= f2)
-                # Integração para obter a potência
                 val = float(np.trapezoid(psd[:, idx], freqs[idx], axis=1).mean())
                 bp[name] = val
                 row[f"{name}_power"] = val
             
             total_power = sum(bp.values())
             row["delta_relative"] = bp["delta"] / total_power if total_power > 0 else np.nan
-            rows.append(row) # Adiciona o dicionário à lista
+            rows.append(row) 
             
-    # CRÍTICO: O DataFrame é criado aqui, fora de todos os loops!
     return pd.DataFrame(rows)
 
 def plot_psd_comparison(eeg_filtered, sf):
@@ -331,9 +340,8 @@ def hep_metric(eeg_filtered, epoch, sf, window_s=1.0, min_rr_s=0.88, amplitude_t
     # = [100+7200, 450+7200, 800+7200]   (se sf=120 e t0=60s → a=7200)
     # = [7300, 7650, 8000]  ← posição real no sinal EEG completo
 
-    hep_values_scalar = [] 
+    hep_values_scalar = [] # list of mean HEP amplitude values for each 1s window
     
-    hep_values_waveform = []
 
     rr_intervals = np.diff(rpeaks_global)  # em amostras
     
@@ -344,8 +352,18 @@ def hep_metric(eeg_filtered, epoch, sf, window_s=1.0, min_rr_s=0.88, amplitude_t
     # define an amplitude threshold to exclude artifacts
 
     # iterate over 1-second windows within the epoch
-    for start in range(a, b - window_samples + 1, window_samples):
-        end = start + window_samples
+
+    n_windows = int((b - a) / window_samples)
+    # b-a = 15360 samples (30s epoch) / 512 Hz = 30s → 30 windows of 1s each 
+    # window_samples = 512 samples (1s) → 30 windows of 512 samples each
+    # n_windows = total_duration / 1 second = 15360 / 512 = 30 windows
+
+    for w in range(n_windows):
+        start = a + w * window_samples
+        end   = start + window_samples
+        # for w=0: start=7200, end=7712
+        # for w=1: start=7712, end=8224
+
         # blocks of 1s that do not overlap: [a, a+window_samples), [a+window_samples, a+2*window_samples), ...
         #  [7200, 7328), [7328, 7456), [7456, 7584)
 
@@ -355,7 +373,6 @@ def hep_metric(eeg_filtered, epoch, sf, window_s=1.0, min_rr_s=0.88, amplitude_t
         # If no R-peaks are found in the window, we can skip or assign NaN
         if len(selected_rpeaks) == 0:
             hep_values_scalar.append(np.nan)
-            hep_values_waveform.append(None)
             continue
         
         # create hep segments for each Rpeak from -200 to +500 ms around the Rpeak
@@ -404,14 +421,13 @@ def hep_metric(eeg_filtered, epoch, sf, window_s=1.0, min_rr_s=0.88, amplitude_t
         # if all rpeaks on the 1s window are discarded then discard all window 
         if len(hep_segments) == 0:
             hep_values_scalar.append(np.nan)
-            hep_values_waveform.append(None)
             continue
 
         hep_epochs = np.array(hep_segments)  
         # shape (n_beats, 1, segment_samples) → (n_beats, segment_samples)
 
-        # Baseline corrections (-200ms a 0ms, modal value do paper)
-        r_idx    = int(abs(tmin) * sf)           # posição do R-peak no segmento
+        # Baseline corrections (-200ms a 0ms, modal value of paper)
+        r_idx    = int(abs(tmin) * sf)           # position of R-peak no segmento
         bl_start = 0                             # -200ms (início do segmento)
         bl_end   = r_idx                         # 0ms (R-peak)
         # baseline shape (n_beats, 1, 1) → (n_beats, 1, segment_samples)
@@ -425,15 +441,11 @@ def hep_metric(eeg_filtered, epoch, sf, window_s=1.0, min_rr_s=0.88, amplitude_t
         # average of the EEG amplitude across beats to get the HEP for that 1-second window
         hep_avg = hep_epochs.mean(axis=0).squeeze()  # shape: (n_samples,)
 
-        hep_values_waveform.append(hep_avg) # shape (n_samples,) = (700,)
 
-        # mean amplitude of the HEP in the -200 to +500 ms window 
+        # mean amplitude of the HEP in the -200 to +600 ms window 
         hep_values_scalar.append(float(hep_avg.mean()) * 1e6)
 
-    return {
-        "scalar": hep_values_scalar,    # lista de floats (µV)
-        "waveform": hep_values_waveform # lista de arrays (700,)
-    }
+    return { "scalar": hep_values_scalar, } # list of floats (µV)
 
 
 def delta_power_1s(eeg_filtered, epoch, sf, window_frequency=1.0):
@@ -479,7 +491,7 @@ def delta_power_1s(eeg_filtered, epoch, sf, window_frequency=1.0):
             continue
     return delta_vals
 
-def HEP_Delta_plot_selected(hep_values, delta_vals, epoch):
+def HEP_Delta_plot_one_epoch(hep_values, delta_vals, epoch):
     hep_values = hep_values["scalar"] 
     t = np.arange(len(delta_vals))
 
@@ -500,89 +512,88 @@ def HEP_Delta_plot_selected(hep_values, delta_vals, epoch):
     plt.tight_layout()
     plt.show()
 
+#Plot HEP and Delta Power across epochs for a given stage
 
-def HEP_Delta_plot_range(eeg_filtered, ecg_R, rem_epochs, epoch_indices, sf):
-    all_hep    = []
-    all_delta  = []
-    all_hr     = []
+def HEP_Delta_HR_plot_new(eeg_filtered, ecg_R, epochs, sf, epoch_range):
+    # [epoch1 (30s), epoch2 (30s), epoch3 (30s), ...]
+    # for each epoch, calculate HEP and Delta Power for 1s windows within the epoch
+    hep_values = []
+    delta_vals = []
+    hr_values = []
 
-    for i in epoch_indices:
-        hep   = hep_metric(eeg_filtered, epoch=ecg_R.iloc[i], sf=sf)
-        hep = hep["scalar"] 
-        delta = delta_power_1s(eeg_filtered, epoch=rem_epochs[i], sf=sf)
-        hr    = ecg_R.iloc[i]["hr_mean_bpm"]  # single HR value per epoch
+    epoch_range = list(epoch_range)
 
-        all_hep.extend(hep)
-        all_delta.extend(delta)
-        all_hr.extend([hr] * 30)  # repeat HR for each of the 30 seconds
+    # iterating over the specified range of epochs
+    for i in epoch_range:
+        epoch = epochs[i] # (t0, t1) OR dict
+        ecg_epoch = ecg_R.iloc[i] if i < len(ecg_R) else None # rpeaks + HR
 
-    t = np.arange(len(all_delta))  # seconds
+        hep = hep_metric(eeg_filtered, ecg_epoch, sf) if ecg_epoch is not None else None
 
-    fig, ax1 = plt.subplots(figsize=(14, 5))
+        # Extract the time range for the delta power calculation
+        delta_epoch = (epoch["t0_s"], epoch["t1_s"]) if isinstance(epoch, (pd.Series, dict)) else epoch
 
-    ax1.plot(t, np.array(all_hep, dtype=float), color="blue", marker="o", markersize=3, label="HEP")
-    ax1.set_xlabel("Time (s)")
-    ax1.set_ylabel("HEP Mean Amplitude (µV)", color="blue")
+        delta = delta_power_1s(eeg_filtered, delta_epoch, sf)
+        hr = ecg_epoch["hr_mean_bpm"] if ecg_epoch is not None and "hr_mean_bpm" in ecg_epoch else np.nan
+
+        # Append the results for this epoch to the lists
+        hep_values.extend(hep["scalar"] if hep is not None else [])
+        delta_vals.extend(delta if delta is not None else [])
+        hr_values.extend([hr] * len(delta if delta is not None else [])) # Repeats HR 30 times → makes it 1 Hz
+
+    n = min(len(hep_values), len(delta_vals), len(hr_values))
+    hep_values = hep_values[:n]
+    delta_vals = delta_vals[:n]
+    hr_values = hr_values[:n]
+
+    t = np.arange(n)
+    fig, ax1 = plt.subplots(figsize=(12, 4))
+    ax1.plot(t, hep_values, color="blue")
+    ax1.set_xlabel("Time (1s windows)")
+    ax1.set_ylabel("HEP (µV)", color="blue")
     ax1.tick_params(axis='y', labelcolor="blue")
 
     ax2 = ax1.twinx()
-    ax2.plot(t, all_delta, color="red", marker="o", markersize=3, label="Delta Power")
-    ax2.set_ylabel("Delta Power (µV²)", color="red")
+    ax2.plot(t, delta_vals, color="red")
+    ax2.set_ylabel("Delta Relative Power", color="red")
     ax2.tick_params(axis='y', labelcolor="red")
 
     ax3 = ax1.twinx()
-    ax3.spines["right"].set_position(("axes", 1.08))  # offset third axis
-    ax3.plot(t, all_hr, color="green", marker="o", markersize=3, linestyle="--", label="HR")
-    ax3.set_ylabel("Heart Rate (bpm)", color="green")
+    ax3.spines["right"].set_position(("axes", 1.08))
+    ax3.plot(t, hr_values, color="green", linestyle="--")
+    ax3.set_ylabel("HR (bpm)", color="green")
     ax3.tick_params(axis='y', labelcolor="green")
 
-    # epoch boundaries
-    for i in range(1, len(epoch_indices)):
-        ax1.axvline(x=i*30, color='gray', linestyle='--', alpha=0.5)
-
-    plt.title(f"HEP, Delta Power and HR — epochs {epoch_indices[0]} to {epoch_indices[-1]}")
+    plt.title(f"HEP + Delta + HR | Epochs {epoch_range[0]} to {epoch_range[-1]}")
     plt.tight_layout()
     plt.show()
 
+# Plot HEP and EEG signal for one epoch 
+def HEP_EEG_plot_one_epoch(hep_values, eeg_filtered, epoch, sf):
+    hep_values = hep_values["scalar"] 
+    t0 = epoch["t0_s"]
+    t1 = epoch["t1_s"]
 
-def HEP_waveform_plot(hep_result, epoch, sf, tmin=-0.2, tmax=0.5):
-    waveforms = [w for w in hep_result["waveform"] if w is not None]
-    
-    if len(waveforms) == 0:
-        print("No valid waveforms to plot.")
-        return
+    a, b = int(t0 * sf), int(t1 * sf)
+    eeg_segment = eeg_filtered[a:b]
 
-    # time axis in ms
-    n_samples = waveforms[0].shape[0]
-    time_ms = np.linspace(tmin * 1000, tmax * 1000, n_samples)
+    t_eeg = np.linspace(0, 30, len(eeg_segment))
+    t_hep = np.linspace(0, 30, len(hep_values))
 
-    grand_avg = np.mean(waveforms, axis=0) * 1e6  # → µV
+    fig, ax1 = plt.subplots(figsize=(10,4))
 
-    fig, ax = plt.subplots(figsize=(10, 4))
+    ax1.plot(t_eeg, eeg_segment * 1e6, color="red", alpha=0.5)  # EEG in µV
+    ax1.set_xlabel("Time (s)")
+    ax1.set_ylabel("EEG (µV)", color="red")
+    ax1.tick_params(axis='y', labelcolor="red")
 
-    # plot each 1s window waveform in light grey
-    for w in waveforms:
-        ax.plot(time_ms, w * 1e6, color="grey", alpha=0.3, linewidth=0.8)
+    ax2 = ax1.twinx()
+    ax2.plot(t_hep, hep_values, color="blue", marker="o")
+    ax2.set_ylabel("HEP Mean Amplitude (µV)", color="blue")
+    ax2.tick_params(axis='y', labelcolor="blue")
 
-    # plot grand average on top
-    ax.plot(time_ms, grand_avg, color="blue", linewidth=2, label=f"Grand avg (n={len(waveforms)})")
-
-    # mark R-peak
-    ax.axvline(x=0, color="red", linestyle="--", linewidth=1, label="R-peak")
-
-    # mark baseline window
-    ax.axvspan(-200, 0, alpha=0.05, color="green", label="Baseline (-200ms to 0ms)")
-
-    # mark typical HEP window (200-600ms)
-    ax.axvspan(200, 500, alpha=0.05, color="blue", label="HEP window (200-500ms)")
-
-    ax.set_xlabel("Time relative to R-peak (ms)")
-    ax.set_ylabel("Amplitude (µV)")
-    ax.set_title(f"HEP Waveform — epoch {epoch['t0_s']:.0f}s to {epoch['t1_s']:.0f}s")
-    ax.legend(loc="upper right")
-    ax.grid(True, alpha=0.3)
-    ax.axhline(y=0, color="black", linewidth=0.5)
-
+    plt.title(f"HEP and EEG — epoch {epoch['t0_s']:.0f}s to {epoch['t1_s']:.0f}s")
+    plt.grid(True)
     plt.tight_layout()
     plt.show()
 
@@ -602,7 +613,14 @@ def plot_hep_delta_correlation(hep_values, delta_vals):
         return None
 
     r_pearson,  p_pearson  = pearsonr(hep_clean, delta_clean)
+    r_spearman, p_spearman = spearmanr(hep_clean, delta_clean)
 
     print(f"Pearson:  r={r_pearson:.3f},  p={p_pearson:.3f}")
+    print(f"Spearman: r={r_spearman:.3f}, p={p_spearman:.3f}")
 
-    return {"pearson_r": r_pearson, "pearson_p": p_pearson}
+    return {
+        "pearson_r": r_pearson,
+        "pearson_p": p_pearson,
+        "spearman_r": r_spearman,
+        "spearman_p": p_spearman,
+    }
