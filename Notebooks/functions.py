@@ -15,8 +15,16 @@ from scipy.stats import pearsonr, spearmanr
 
 
 def compute_stage_epochs(df, stage_label):
-    # (t0, t1) = (onset_s, onset_s + duration)
+    # extract time intervals (t0, t1) for a given sleep stage.
+    # input: dataframe with columns "Sleep Stage", "onset_s", "Duration[s]"
+    # output: list of tuples [(t0, t1), ...] in seconds for each epoch of the given sleep stage
 
+    #- Filter rows matching the desired stage
+    # Convert each row into a time interval:
+    # start = onset_s
+    # end   = onset_s + duration
+
+    # (t0, t1) = (onset_s, onset_s + duration)
     stage_df = df[df["Sleep Stage"] == stage_label].copy()
 
     if stage_df.empty:
@@ -30,16 +38,28 @@ def compute_stage_epochs(df, stage_label):
     return epochs
 
 def add_epoch_onsets(df, epoch_len):
+    # Creates absolute time reference when only epoch index exists.
+    # Add a time axis assuming fixed-length epochs.
     # add all epochs to the data frame 
+    # input: dataframe with columns "Sleep Stage", "Duration[s]", epoch_len in seconds
+    # output: dataframe with an additional column "onset_s" indicating the start time of each epoch in seconds, assuming epochs are contiguous and of fixed length
     df = df.copy()
     df["onset_s"] = np.arange(len(df)) * epoch_len
     return df
 
 def pick_core_channels(raw):
+    # select only the core channels (F4-C4 for EEG and ECG1-ECG2 for ECG) for further analysis
     core_chs = ["F4-C4", "ECG1-ECG2"]
     return raw.copy().pick(core_chs)
 
 def preprocess_eeg(raw, notch_freqs=(50, 100), l_freq=0.3, h_freq=35.0):
+    # Preprocess EEG signal
+    # 1. select only the EEG channel (F4-C4)
+    # 2. apply notch filter at 50 and 100 Hz to remove power line noise
+    # 3. apply bandpass filter from 0.3 to 35 Hz
+    # output: 1D numpy array of the preprocessed EEG signal for the F4-C4 channel
+    # Note -> the output is in Volts (V) since MNE reads EEG data in V
+
     eeg = raw.copy()
     eeg = eeg.pick(["F4-C4"])  # pick only the EEG channel for preprocessing
     if notch_freqs is not None:
@@ -53,6 +73,11 @@ def preprocess_eeg(raw, notch_freqs=(50, 100), l_freq=0.3, h_freq=35.0):
     return eeg.get_data()[0] # return 1D array of the EEG channel
 
 def preprocess_ecg(raw, method="neurokit", lowcut=0.5, highcut=45):
+    # Preprocess ECG signal
+    # 1. select only the ECG channel (ECG1-ECG2)
+    # 2. apply bandpass filter from 0.5 to 45 Hz using NeuroKit2's ecg_clean function
+    # output: 1D numpy array of the preprocessed ECG signal for the ECG1-ECG2 channel
+
     sf = raw.info["sfreq"] # sampling frequency
     ecg = raw.get_data(picks="ECG1-ECG2")[0]
 
@@ -63,6 +88,13 @@ def preprocess_ecg(raw, method="neurokit", lowcut=0.5, highcut=45):
     return ecg_clean # return 1D array of the cleaned ECG signal
 
 def compute_psd(eeg_filtered, sf, fmin=0.5, fmax=40,  n_per_seg=2048, n_fft=4096,  n_overlap=1024):
+    # Compute Power Spectral Density (PSD) of the EEG signal using Welch's method.
+    # Parameters:
+    # n_per_seg = 2048 → 4s windows
+    # n_fft = 4096 → frequency resolution = 0.125 Hz
+    # overlap = 50%
+
+    #output: psd (power spectral density) (µV²/Hz) and freqs (corresponding frequencies) (Hz)
 
     # n_per_seg: Length of each segment for Welch's method 
     # window length = 2048 / 512 = 4.0 seconds
@@ -88,6 +120,8 @@ def compute_psd(eeg_filtered, sf, fmin=0.5, fmax=40,  n_per_seg=2048, n_fft=4096
     return psd, freqs
 
 def summarize_psd(raw_data, filtered_data):
+    # Compare PSD statistics before vs after filtering.
+    # output:  prints mean ± std of PSD
     # mean and std of PSD across frequencies for each channel - RAW
     raw_mean = raw_data.mean()
     raw_std = raw_data.std()
@@ -102,6 +136,29 @@ def summarize_psd(raw_data, filtered_data):
     # if std is large compared to mean ->  more variability 
 
 def eeg_bandpower(eeg_filtered, stage_epochs_dict, sf, min_epoch_s=2.0):
+    # Compute EEG bandpower per epoch and per sleep stage.
+    # input: 
+        # eeg_filtered : 1D EEG signal (Volts)
+        # stage_epochs_dict : dict
+        #     {stage_name: [(t0, t1), ...]}
+        # sf : sampling frequency (Hz)
+        # min_epoch_s : minimum duration required to compute PSD
+    
+    # Output:
+        #  DataFrame with:
+        # stage
+        # epoch index
+        # start time
+        # band powers (delta, theta, alpha, beta, gamma)
+        # relative delta power
+
+    # Pipeline:
+    # 1. Loop over sleep stages and their epochs
+    # 2. Extract EEG segment for each epoch
+    # 3. Compute PSD (Welch)
+    # 4. Integrate PSD over frequency bands
+    # 5. Compute relative delta = delta / total power
+
     bands = {"delta": (0.5, 4), "theta": (4, 8), "alpha": (8, 12), "beta": (12, 30), "gamma": (30, 40)}
     rows = []
     n = len(eeg_filtered)
@@ -136,9 +193,22 @@ def eeg_bandpower(eeg_filtered, stage_epochs_dict, sf, min_epoch_s=2.0):
             row["delta_relative"] = bp["delta"] / total_power if total_power > 0 else np.nan
             rows.append(row) 
             
+            # Notes:
+                # Uses trapezoidal integration (np.trapezoid)
+                # Skips:
+                    # very short segments
+                    # flat signals (all zeros)
+
+            # Bandpower is a robust proxy for sleep depth:
+                # delta ↑ → deeper sleep
+                # alpha/beta ↑ → wake/arousal
+
     return pd.DataFrame(rows)
 
 def plot_psd_comparison(eeg_filtered, sf):
+    # Visualize EEG Power Spectral Density with band highlighting.
+    # input: eeg_filtered : 1D EEG signal (Volts) and sf (sampling frequency in Hz)
+    # output: plot of PSD with shaded areas for delta, theta, alpha, beta, gamma bands
 
     psd, freqs = psd_array_welch(eeg_filtered[np.newaxis, :], sfreq=sf, fmin=0.5, fmax=40, verbose=False)
     psd = psd[0]
@@ -148,6 +218,10 @@ def plot_psd_comparison(eeg_filtered, sf):
     plt.figure(figsize=(12, 5))
 
     plt.semilogy(freqs, psd, color='black', linewidth=2, label='Total PSD')
+
+    # Strong delta peak → deep sleep
+    # Alpha peak → wake/relaxed
+    # Broad high freq → noise or muscle activity
 
     for name, (fmin, fmax, color) in bands.items():
         idx = (freqs >= fmin) & (freqs <= fmax)
@@ -164,6 +238,30 @@ def plot_psd_comparison(eeg_filtered, sf):
 
 
 def extract_ecg_per_epoch(ecg_sig_total, ecg_clean_total, epochs, sf, detect_peaks=True):
+    # Extract ECG features per epoch.
+    # Input: 
+        # ecg_sig_total : 1D numpy array of raw ECG signal (Volts)
+        # ecg_clean_total : 1D numpy array of cleaned ECG signal (Volts)
+        # epochs : list of tuples [(t0, t1), ...] in seconds for each epoch
+        # sf : sampling frequency (Hz)
+        # detect_peaks : boolean, whether to detect R-peaks
+
+    # Output: DataFrame with columns:
+        # epoch
+        # t0_s
+        # t1_s
+        # dur_s
+        # raw_seg (numpy array)
+        # clean_seg (numpy array)
+        # rpeaks (numpy array)
+        # n_peaks (int)
+        # hr_mean_bpm (float)
+        # ok (bool)
+
+    # 1. Loop over epochs, extract raw and cleaned ECG segments
+    # 2. Detect R-peaks in the cleaned segment using NeuroKit2
+    # 3. Calculate mean heart rate (bpm) = 60 * number of peaks / duration in seconds
+
     rows = []
     for i, (t0, t1) in enumerate(epochs):
 
@@ -192,10 +290,37 @@ def extract_ecg_per_epoch(ecg_sig_total, ecg_clean_total, epochs, sf, detect_pea
 
         except Exception as e:
             rows.append({"epoch": i,  "t0_s": float(t0), "t1_s": float(t1), "dur_s": float(t1 - t0), "raw_seg": x_raw, "clean_seg": x_clean, "rpeaks": None, "n_peaks": 0,"hr_mean_bpm": hr_mean,   "ok": False, "error": str(e)})
-
+    
+    # R-peaks are stored RELATIVE to the epoch
+    # These will later be aligned to global EEG time (HEP)
+    
     return pd.DataFrame(rows)
 
 def hrv_per_epoch(ecg, epochs, sf):
+    # Compute HRV metrics per epoch.
+    # Input:
+        # ecg : 1D numpy array
+        # epochs : list of tuples
+        # sf : sampling frequency (Hz)
+    
+    # Output: DataFrame with columns:
+        # epoch
+        # start_s
+        # hr_mean_bpm
+        # rmssd_ms (parasympathetic activity)
+        # sdnn_ms (overall variability)
+        # pnn50_pct (beat-to-beat variability)
+        # n_beats
+        # ok (boolean)
+        # error (string, if ok is False)
+
+    # 1. Extract ECG segment
+    # 2. Run NeuroKit ecg_process
+    # 3. Extract HR + HRV time-domain metrics
+
+    # RMSSD ↑ → parasympathetic dominance
+    # SDNN ↑ → overall variability
+
     rows = []
     for i, (t0, t1) in enumerate(epochs):
         a, b = int(t0*sf), int(t1*sf)
@@ -216,9 +341,18 @@ def hrv_per_epoch(ecg, epochs, sf):
     return pd.DataFrame(rows)
 
 def extract_resp_from_ecg(ecg, sf, method="neurokit"):
-    # Extract respiratory signal from ECG
-    # resp : 1D numpy array
+    # Estimate respiration signal from ECG~
+
+    # Input: ecg : 1D numpy array of ECG signal (Volts) and sf : sampling frequency (Hz)
+    # Output: resp : 1D numpy array of estimated respiration signal (arbitrary units)
+
+    # 1. detect r-peaks using NeuroKit2
+    # 2. compute instantaneous heart rate from r-peaks
+    # 3. extract respiratory signal (ecg_resp)
+    # 4. bandpass filter (0.05-0.7 Hz) to isolate breathing-related modulation
+
     # NeuroKit extracts low-frequency modulation of ECG
+
     # caused by breathing (respiratory sinus arrhythmia and thoracic impedance effects).
     peaks, info = nk.ecg_peaks(ecg, sampling_rate=sf)
 
@@ -236,11 +370,35 @@ def extract_resp_from_ecg(ecg, sf, method="neurokit"):
     return resp
 
 def hpc_metric(ecg, resp, epochs, sf, window_epochs):
-    # ecg : 1D numpy array
-    # resp : 1D numpy array
-    # epochs : list of tuples
-    # sf : float
-    # window_epochs : int
+    #  Compute Cardio-Pulmonary Coupling (CPC) over sliding epoch windows.
+    # Input:
+        # ecg : 1D numpy array of ECG signal (Volts)
+        # resp : 1D numpy array of estimated respiration signal (arbitrary units)
+        # epochs : list of tuples [(t0, t1), ...] in seconds for each epoch
+        # sf : sampling frequency (Hz)
+        # window_epochs : number of epochs to include in each window for CPC calculation  
+            # 5 epochs = 2.5 minutes if epochs are 30s
+    
+    # Output: DataFrame with columns:
+        # epoch (index of the first epoch in the window)
+        # HFC (high-frequency coupling power, µV²)
+        # LFC (low-frequency coupling power, µV²)
+        # LFC/HFC ratio
+        # ok (boolean)
+        # error (string, if ok is False)
+
+    # 1. Group consecutive epochs into larger windows (≥120s recommended)
+    # 2. For each window:
+        # a. Extract ECG and respiration segments
+        # b. Detect R-peaks and compute RR intervals
+        # c. Resample RR intervals and respiration to common time grid (e.g., 4 Hz)
+        # d. Compute cross-spectral density (CSD) and coherence between RR and respiration
+            # CPC = |CSD| × coherence
+        # e. Integrate CSD weighted by coherence over LF (0.01-0.15 Hz) and HF (0.15-0.40 Hz) bands to get LFC and HFC
+        # f. Compute LFC/HFC ratio as a measure of coupling balance
+    
+    # HFC ↑ → stable sleep (strong heart–lung synchrony)
+    # LFC ↑ → unstable sleep (weaker synchrony, more arousals)
 
     rows = []
     fs_cpc = 4  # 4 Hz is typical for HRV spectral analysis
@@ -265,22 +423,31 @@ def hpc_metric(ecg, resp, epochs, sf, window_epochs):
              rpeaks = info["ECG_R_Peaks"]
 
              rr = np.diff(rpeaks) / sf  # RR intervals in seconds
-             t_rr = np.cumsum(rr)  # Time points of RR intervals
+             t_rr = rpeaks[1:] / sf  # Time points of RR intervals
 
              # Resample RR intervals and respiratory signal to a common time grid 
              # Create uniform time grid at fs_cpc Hz
              t_grid = np.arange(t_rr[0], t_rr[-1], 1/fs_cpc)
+
+             if len(rpeaks) < 20:
+                continue
+             
+             if len(rr) < 10:
+                continue
+             
+             if len(t_grid) < 64:
+                continue
 
              # Interpolate RR intervals onto uniform grid
              rr_resampled = np.interp(t_grid, t_rr, rr)  # Resample RR intervals to common grid
             
              # time axis for respiration
              t_resp_grid = np.arange(len(x_resp))/sf
+
              # Interpolate respiration to same time grid 
              x_resp_resampled = np.interp(t_grid, t_resp_grid, x_resp)  
 
-             # Number of samples per segment
-             nps = min(64, len(rr_resampled))
+             nps = 128  # 16s windows at 4 Hz → 16*4 = 128 samples per segment for spectral analysis
 
              # Cross-spectral density between RR and respiration 
              f, Cxy = csd(rr_resampled, x_resp_resampled, fs=fs_cpc, nperseg=nps)
@@ -293,6 +460,10 @@ def hpc_metric(ecg, resp, epochs, sf, window_epochs):
 
              lf_mask = (f >= 0.01) & (f <= 0.15)
              hf_mask = (f >= 0.15) & (f <= 0.40)
+
+             if not np.any(hf_mask) or not np.any(lf_mask):
+                continue
+             
              HFC = np.trapezoid(CPC[hf_mask], f[hf_mask]) * 1e6  # convert to µV²
              LFC = np.trapezoid(CPC[lf_mask], f[lf_mask]) * 1e6  # convert to µV²
              LFC_HFC_ratio = LFC / HFC if HFC > 0 else np.nan
@@ -306,6 +477,15 @@ def hpc_metric(ecg, resp, epochs, sf, window_epochs):
     return pd.DataFrame(rows)
 
 def classify_sleep_stable_unstable(hpc_df):
+    # Classify sleep stability based on CPC
+
+    # HFC > LFC → stable sleep
+    # HFC ≤ LFC → unstable sleep
+    # HFC = LFC = 0 → undefined
+    # HFC or LFC is NaN → undefined
+
+    # stable   → strong parasympathetic / synchronized state
+    # unstable → fragmented / dysregulated sleep
 
     df = hpc_df.copy()
 
@@ -314,6 +494,7 @@ def classify_sleep_stable_unstable(hpc_df):
 
     # if both HFC and LFC are zero -> undefined
     df.loc[(df["HFC"] == 0) & (df["LFC"] == 0), "sleep_stability"] = "undefined"
+
     # if either HFC or LFC is NaN -> undefined
     df.loc[(df["HFC"].isna()) | (df["LFC"].isna()), "sleep_stability"] = "undefined"
 
@@ -321,11 +502,43 @@ def classify_sleep_stable_unstable(hpc_df):
 
 
 def hep_metric(eeg_filtered, epoch, sf, window_s=1.0, min_rr_s=0.88, amplitude_threshold_uv=100.0):
+    # Compute Heartbeat-Evoked Potentials (HEP) per 1-second window
+    # Input:
+        #  eeg_filtered : full EEG signal (1D, Volts)
+        # epoch: row containing:
+            # t0_s, t1_s (epoch timing)
+            # rpeaks (relative to epoch)
+        # sf: sampling frequency
+        # window_s: temporal resolution (default = 1s)
+        # min_rr_s: minimum RR interval to avoid overlap
+        # amplitude_threshold_uv : artifact rejection threshold
+
+    # Output: list of mean HEP amplitude values for each 1-second window within the epoch
+
+    # 1. Convert epoch time → sample indices
+    # 2. Align R-peaks to global EEG timeline
+    # 3. Split epoch into 1-second windows
+    # 4. For each window:
+        # a. Select R-peaks within window
+        # b. Extract EEG segments around each R-peak (-200ms to +600ms)
+        # c. Reject:
+            # overlapping beats (short RR)
+            # high-amplitude artifacts
+        # d. Detrend signal
+        # e. Baseline correction (-200ms to 0ms)
+        # f. Average across beats → HEP waveform
+        # g. Reduce to scalar (mean amplitude)
+    
+    # HEP reflects cortical processing of cardiac signals:
+    # higher amplitude → stronger brain–heart interaction
+    # modulated by attention, sleep stage, autonomic state
+
     # epoch = ecg_R.iloc[1]
     tmin, tmax = -0.2, 0.6
 
     t0 = epoch["t0_s"]
     t1 = epoch["t1_s"]
+
     # Convert epoch start and end times from seconds to sample indices
     a, b = int(t0 * sf), int(t1 * sf) 
     window_samples = int(window_s * sf)
@@ -341,7 +554,6 @@ def hep_metric(eeg_filtered, epoch, sf, window_s=1.0, min_rr_s=0.88, amplitude_t
     # = [7300, 7650, 8000]  ← posição real no sinal EEG completo
 
     hep_values_scalar = [] # list of mean HEP amplitude values for each 1s window
-    
 
     rr_intervals = np.diff(rpeaks_global)  # em amostras
     
@@ -376,7 +588,8 @@ def hep_metric(eeg_filtered, epoch, sf, window_s=1.0, min_rr_s=0.88, amplitude_t
             continue
         
         # create hep segments for each Rpeak from -200 to +500 ms around the Rpeak
-        hep_segments = [] # shape (1, 700)
+        hep_segments = [] # shape (1, 410)
+        # 0.6 -(-0.2) = 0.8 -> 0.8 * 512 = 410
     
         # r is relative to the epoch start
         # r is the global sample index 
@@ -397,6 +610,7 @@ def hep_metric(eeg_filtered, epoch, sf, window_s=1.0, min_rr_s=0.88, amplitude_t
 
             r_idx_global = np.where(rpeaks_global == r)[0] 
             # find the index of the R-peak in the global list of R-peaks for the epoch
+
             if len(r_idx_global) > 0:
                 r_idx_global = r_idx_global[0] 
                 if r_idx_global < len(rr_intervals):
@@ -415,7 +629,7 @@ def hep_metric(eeg_filtered, epoch, sf, window_s=1.0, min_rr_s=0.88, amplitude_t
             segment = detrend(segment, axis=1)  # axis=1 = along time
             
             # append the segments 
-            # (1, 700) → (n_beats, 700) 
+            # (1, 410) → (n_beats, 410) 
             hep_segments.append(segment)
 
         # if all rpeaks on the 1s window are discarded then discard all window 
@@ -435,8 +649,7 @@ def hep_metric(eeg_filtered, epoch, sf, window_s=1.0, min_rr_s=0.88, amplitude_t
         # baseline is the mean amplitude in the -200 to 0 ms window for each beat, used to correct for slow drifts in the EEG signal
         hep_epochs = hep_epochs - baseline
 
-
-        # (3, 1, 700) → (1, 700)
+        # (3, 1, 410) → (1, 410)
         # (n_beats, 1, n_samples) → (1, n_samples) → (n_samples,)
         # average of the EEG amplitude across beats to get the HEP for that 1-second window
         hep_avg = hep_epochs.mean(axis=0).squeeze()  # shape: (n_samples,)
@@ -445,27 +658,55 @@ def hep_metric(eeg_filtered, epoch, sf, window_s=1.0, min_rr_s=0.88, amplitude_t
         # mean amplitude of the HEP in the -200 to +600 ms window 
         hep_values_scalar.append(float(hep_avg.mean()) * 1e6)
 
-    return { "scalar": hep_values_scalar, } # list of floats (µV)
+    return hep_values_scalar # list of floats (µV)
 
 
 def delta_power_1s(eeg_filtered, epoch, sf, window_frequency=1.0):
-    delta_vals  = []
-    window_samples = int(window_frequency * sf)
+    # Compute relative delta power per 1-second window
+
+    # Input:
+        # eeg_filtered : full EEG signal (1D, Volts)
+        # epoch: tuple (t0, t1) in seconds
+        # sf: sampling frequency (Hz)
+        # window_frequency: frequency of the window (Hz)
+
+    # Output: list of relative delta power values for each 1-second window within the epoch
+
+    # 1. Split epoch into 1-second segments
+    # 2. Compute PSD per segment
+    # 3. Integrate power across frequency bands
+    # 4. Compute: delta_relative = delta / total power
+
+    # high delta → deep sleep
+    # low delta → lighter sleep / REM
+
+    delta_vals  = [] # to restore delta values (30)
+
+    # converts seconds to samples 
+    # sf = 512 Hz
+    # window_frequency = 1s
+    # window_samples = 512 Hz
+    window_samples = int(window_frequency * sf) 
+
     t0, t1 = epoch
     a, b = int(t0 * sf), int(t1 * sf)
+    # t0 = 30s -> a = 30*512 = 15360
+    # t1 = 60s -> b = 30720
 
     if a < 0 or b > len(eeg_filtered) or a >= b:
         return None
 
     bands = {"delta": (0.5, 4), "theta": (4, 8), "alpha": (8, 12), "beta": (12, 30), "gamma": (30, 40)}
 
-    epoch_signal = eeg_filtered[a:b]
+    epoch_signal = eeg_filtered[a:b] # isolate 30s EEG segment 
 
     for start in range(0, (b - a) - window_samples + 1, window_samples):
+
+        # (b - a) = length of epoch (in samples)
         end = start + window_samples
         segment = epoch_signal[start:end]
 
-        if segment.size < window_samples:
+        if segment.size < window_samples: # 
             continue
 
         try:
@@ -477,10 +718,11 @@ def delta_power_1s(eeg_filtered, epoch, sf, window_frequency=1.0):
             psd, freqs = psd_array_welch(segment[None, :], sfreq=sf, fmin=0.5, fmax=40.0, verbose=False)
             psd_seg = psd[0]
 
-            powers = {}
-            for name, (f1, f2) in bands.items():
-                idx = (freqs >= f1) & (freqs <= f2)
+            powers = {} # store power per band
+            for name, (f1, f2) in bands.items(): # loop through bands
+                idx = (freqs >= f1) & (freqs <= f2) # boolean mask → picks frequencies in that band
 
+                # integrates PSD curve over frequency
                 powers[name] = float(np.trapezoid(psd_seg[idx], freqs[idx])) if np.any(idx) else 0.0
             
             total_power = sum(powers.values())
@@ -489,10 +731,20 @@ def delta_power_1s(eeg_filtered, epoch, sf, window_frequency=1.0):
             delta_vals.append(rel_delta)
         except Exception:
             continue
+
     return delta_vals
 
 def HEP_Delta_plot_one_epoch(hep_values, delta_vals, epoch):
-    hep_values = hep_values["scalar"] 
+    # Plot HEP and delta power within a single epoch
+
+    # Input:
+        # hep_values : list of mean HEP amplitude values for each 1-second window within
+        # delta_vals : list of relative delta power values for each 1-second window within the same epoch
+        # epoch : row containing t0_s and t1_s for the epoch (or tuple (t0, t1))
+
+    # Output: a plot with two y-axes showing HEP and delta power across the 1-second windows of the epoch
+
+    hep_values = hep_values 
     t = np.arange(len(delta_vals))
 
     fig, ax1 = plt.subplots(figsize=(10,4))
@@ -512,9 +764,26 @@ def HEP_Delta_plot_one_epoch(hep_values, delta_vals, epoch):
     plt.tight_layout()
     plt.show()
 
-#Plot HEP and Delta Power across epochs for a given stage
 
 def HEP_Delta_HR_plot_new(eeg_filtered, ecg_R, epochs, sf, epoch_range):
+    #  Plot combined HEP, delta power, and heart rate across multiple epochs
+
+    # Input: 
+        # eeg_filtered : full EEG signal (1D, Volts)
+        # ecg_R : DataFrame with ECG features per epoch (including R-peaks and
+        # epochs : list of tuples [(t0, t1), ...] in seconds for each epoch
+        # sf : sampling frequency (Hz)
+        # epoch_range : list of epoch indices to include in the plot (e.g., range(0, 10) for the first 10 epochs)
+    
+    # Output: a plot with three y-axes showing HEP, delta power, and heart rate across the specified range of epochs
+
+    # 1. Loop through selected epochs
+    # 2. Compute:
+        # HEP (per second)
+        # Delta power (per second)
+        # HR (constant per epoch → repeated)
+    # 3. Concatenate into continuous signals
+
     # [epoch1 (30s), epoch2 (30s), epoch3 (30s), ...]
     # for each epoch, calculate HEP and Delta Power for 1s windows within the epoch
     hep_values = []
@@ -533,11 +802,14 @@ def HEP_Delta_HR_plot_new(eeg_filtered, ecg_R, epochs, sf, epoch_range):
         # Extract the time range for the delta power calculation
         delta_epoch = (epoch["t0_s"], epoch["t1_s"]) if isinstance(epoch, (pd.Series, dict)) else epoch
 
+        # 30 second epochs -> 30 values
         delta = delta_power_1s(eeg_filtered, delta_epoch, sf)
+
+        # one value per epoch not per second! 
         hr = ecg_epoch["hr_mean_bpm"] if ecg_epoch is not None and "hr_mean_bpm" in ecg_epoch else np.nan
 
         # Append the results for this epoch to the lists
-        hep_values.extend(hep["scalar"] if hep is not None else [])
+        hep_values.extend(hep if hep is not None else [])
         delta_vals.extend(delta if delta is not None else [])
         hr_values.extend([hr] * len(delta if delta is not None else [])) # Repeats HR 30 times → makes it 1 Hz
 
@@ -568,9 +840,16 @@ def HEP_Delta_HR_plot_new(eeg_filtered, ecg_R, epochs, sf, epoch_range):
     plt.tight_layout()
     plt.show()
 
-# Plot HEP and EEG signal for one epoch 
 def HEP_EEG_plot_one_epoch(hep_values, eeg_filtered, epoch, sf):
-    hep_values = hep_values["scalar"] 
+    # Plot HEP and EEG signal for one epoch 
+    # Input:
+        # hep_values : list of mean HEP amplitude values for each 1-second window within the epoch
+        # eeg_filtered : full EEG signal (1D, Volts)
+        # epoch : row containing t0_s and t1_s for the epoch (or tuple (t0, t1))
+        # sf : sampling frequency (Hz)
+    # Output: a plot with two y-axes showing HEP and EEG signal across the 30-second epoch
+
+    hep_values = hep_values 
     t0 = epoch["t0_s"]
     t1 = epoch["t1_s"]
 
@@ -597,9 +876,25 @@ def HEP_EEG_plot_one_epoch(hep_values, eeg_filtered, epoch, sf):
     plt.tight_layout()
     plt.show()
 
-# Correlation between HEP and Delta Power across epochs
-# using pearson correlation coefficient
+
 def plot_hep_delta_correlation(hep_values, delta_vals):
+    # Correlation between HEP and Delta Power across epochs
+    # Input:
+        # hep_values : list of mean HEP amplitude values for each 1-second window across
+        # delta_vals : list of relative delta power values for each 1-second window across the same epochs
+    
+    # Output: prints Pearson and Spearman correlation coefficients and p-values
+
+    # 1. Convert to numpy arrays
+    # 2. Remove NaN pairs (important)
+    # 3. Compute:
+        # Pearson correlation (linear)
+        # Spearman correlation (rank-based)
+    
+    # positive correlation → stronger HEP during deep sleep
+    # negative correlation → inverse relationship
+    # Spearman more robust to non-linear effects
+
     hep   = np.array(hep_values, dtype=float)
     delta = np.array(delta_vals, dtype=float)
 
