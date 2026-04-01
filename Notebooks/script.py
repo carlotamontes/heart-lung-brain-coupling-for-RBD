@@ -44,6 +44,7 @@ from scipy.stats import pearsonr, spearmanr
 # USING HEP_METRIC FUNCTION FOR HEP AMPLITUDE
 # USING DELTA_POWER_1S FUNCTION FOR DELTA POWER 
 # USING PEARSONR AND SPEARMANR FOR CORRELATION BETWEEN HEP AMPLITUDE AND DELTA POWER
+# PER SLEEP STAGE (Wake, N1, N2, N3, REM)
     # Pearson correlation pearson_r  
     # Pearson correlation pearson_p
     # Spearman correlation spearman_r
@@ -58,12 +59,20 @@ from scipy.stats import pearsonr, spearmanr
 #             /sleep stage
 #             /HEP values (30,)
 #             /delta power values (30,) 
+#             / Pearson correlation pearson_r 
+#             / Pearson correlation pearson_p
+#             / Spearman correlation spearman_r
+#             / Spearman correlation spearman_p
 #         /Epoch_2
 #             /Epoch Start Time
 #             /Epoch End Time   
 #             /sleep stage
 #             /HEP values (30,)
 #             /delta power values (30,) 
+#             / Pearson correlation pearson_r 
+#             / Pearson correlation pearson_p
+#             / Spearman correlation spearman_r
+#             / Spearman correlation spearman_p
 
 # PIPELINE ----------------------------------
 

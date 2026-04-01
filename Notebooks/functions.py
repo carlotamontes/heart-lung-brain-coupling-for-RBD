@@ -919,3 +919,271 @@ def plot_hep_delta_correlation(hep_values, delta_vals):
         "spearman_r": r_spearman,
         "spearman_p": p_spearman,
     }
+
+# create a function that hep_metric but for a 30s window
+
+def hep_metric_30s(eeg_filtered, epoch, sf, min_rr_s=0.88, amplitude_threshold_uv=100.0):
+
+    tmin, tmax = -0.2, 0.6
+
+    t0 = epoch["t0_s"]
+    t1 = epoch["t1_s"]
+
+    a, b = int(t0 * sf), int(t1 * sf)
+
+    rpeaks = epoch["rpeaks"]
+    if rpeaks is None or len(rpeaks) < 2:
+        return np.nan
+
+    rpeaks_global = np.array(rpeaks) + a
+
+    rr_intervals = np.diff(rpeaks_global)
+    min_rr_samples = int(min_rr_s * sf)
+
+    amplitude_threshold = amplitude_threshold_uv * 1e-6
+
+    hep_peaks = []
+
+    for i, r in enumerate(rpeaks_global):
+
+        seg_start = int(r + tmin * sf)
+        seg_stop  = int(r + tmax * sf)
+
+        if seg_start < 0 or seg_stop > len(eeg_filtered):
+            continue
+
+        # RR filtering
+        if i < len(rr_intervals):
+            if rr_intervals[i] < min_rr_samples:
+                continue
+
+        segment = eeg_filtered[seg_start:seg_stop][None, :]
+
+        # artifact rejection
+        if np.max(np.abs(segment)) > amplitude_threshold:
+            continue
+
+        # detrend
+        segment = detrend(segment, axis=1)
+
+        # baseline correction (-200ms to 0ms)
+        r_idx = int(abs(tmin) * sf)
+        baseline = segment[:, :r_idx].mean(axis=1, keepdims=True)
+        segment = segment - baseline
+
+        # 🔴 peak amplitude per beat
+        peak_amp = np.max(np.abs(segment))
+        hep_peaks.append(peak_amp)
+
+    if len(hep_peaks) == 0:
+        return np.nan
+
+    hep_peaks = np.array(hep_peaks) * 1e6  # V → µV
+
+    # 🔴 final 30s value
+    return float(np.mean(hep_peaks))
+
+def delta_power_30s(eeg_filtered, epoch, sf):
+
+    t0 = epoch["t0_s"]
+    t1 = epoch["t1_s"]
+    a, b = int(t0 * sf), int(t1 * sf)
+
+    if a < 0 or b > len(eeg_filtered) or a >= b:
+        return np.nan
+
+    segment = eeg_filtered[a:b]
+
+    bands = {
+        "delta": (0.5, 4),
+        "theta": (4, 8),
+        "alpha": (8, 12),
+        "beta": (12, 30),
+        "gamma": (30, 40)
+    }
+
+    psd, freqs = psd_array_welch(segment[None, :], sfreq=sf, fmin=0.5, fmax=40.0, verbose=False)
+    psd = psd[0]
+
+    powers = {}
+    for name, (f1, f2) in bands.items():
+        idx = (freqs >= f1) & (freqs <= f2)
+        powers[name] = float(np.trapezoid(psd[idx], freqs[idx])) if np.any(idx) else 0.0
+
+    total_power = sum(powers.values())
+    rel_delta = powers["delta"] / total_power if total_power > 0 else 0.0
+
+    return rel_delta
+
+# function to create a wavelengt
+# in theory we just detect the r peaks in a 30s window and do the mean/max of each sample
+# if we have a window with 40 r peaks, we will end up with an arrat of 410 values
+# each value of the 410 arrat will be the mean of all the samples of the 40 peaks
+# for sample[1] we do the mean of the 40 sample [1] we got from the 40 r peaks 
+
+def hep_waveform_mean(eeg_filtered, epoch, sf,
+                      tmin=-0.2, tmax=0.6,
+                      min_rr_s=0.88,
+                      amplitude_threshold_uv=100.0):
+
+    t0 = epoch["t0_s"]
+    a = int(t0 * sf)
+
+    rpeaks = epoch["rpeaks"]
+    if rpeaks is None or len(rpeaks) < 2:
+        return None
+
+    rpeaks_global = np.array(rpeaks) + a
+
+    rr_intervals = np.diff(rpeaks_global)
+    min_rr_samples = int(min_rr_s * sf)
+    amplitude_threshold = amplitude_threshold_uv * 1e-6
+
+    segments = []
+
+    for i, r in enumerate(rpeaks_global):
+
+        seg_start = int(r + tmin * sf)
+        seg_stop  = int(r + tmax * sf)
+
+        if seg_start < 0 or seg_stop > len(eeg_filtered):
+            continue
+
+        if i < len(rr_intervals):
+            if rr_intervals[i] < min_rr_samples:
+                continue
+
+        segment = eeg_filtered[seg_start:seg_stop]
+
+        if np.max(np.abs(segment)) > amplitude_threshold:
+            continue
+
+        segment = detrend(segment)
+
+        r_idx = int(abs(tmin) * sf)
+        baseline = segment[:r_idx].mean()
+        segment = segment - baseline
+
+        segments.append(segment)
+
+    if len(segments) == 0:
+        return None
+
+    segments = np.array(segments)  # shape (n_beats, 410)
+
+    # 🔵 MÉDIA por sample
+    hep_avg = np.mean(segments, axis=0)  # shape (410,)
+
+    return hep_avg * 1e6  # µV
+
+def hep_waveform_max(eeg_filtered, epoch, sf,
+                     tmin=-0.2, tmax=0.6,
+                     min_rr_s=0.88,
+                     amplitude_threshold_uv=100.0):
+
+    t0 = epoch["t0_s"]
+    a = int(t0 * sf)
+
+    rpeaks = epoch["rpeaks"]
+    if rpeaks is None or len(rpeaks) < 2:
+        return None
+
+    rpeaks_global = np.array(rpeaks) + a
+
+    rr_intervals = np.diff(rpeaks_global)
+    min_rr_samples = int(min_rr_s * sf)
+    amplitude_threshold = amplitude_threshold_uv * 1e-6
+
+    segments = []
+
+    for i, r in enumerate(rpeaks_global):
+
+        seg_start = int(r + tmin * sf)
+        seg_stop  = int(r + tmax * sf)
+
+        if seg_start < 0 or seg_stop > len(eeg_filtered):
+            continue
+
+        if i < len(rr_intervals):
+            if rr_intervals[i] < min_rr_samples:
+                continue
+
+        segment = eeg_filtered[seg_start:seg_stop]
+
+        if np.max(np.abs(segment)) > amplitude_threshold:
+            continue
+
+        segment = detrend(segment)
+
+        r_idx = int(abs(tmin) * sf)
+        baseline = segment[:r_idx].mean()
+        segment = segment - baseline
+
+        segments.append(segment)
+
+    if len(segments) == 0:
+        return None
+
+    segments = np.array(segments)  # shape (n_beats, 410)
+
+    # 🔴 MÁXIMO por sample (across beats)
+    hep_max = np.max(segments, axis=0)  # shape (410,)
+
+    return hep_max * 1e6  # µV
+
+    # create waveform plot 
+    
+def plot_epoch_hep_eeg_hr(eeg_filtered,ecg_epoch, sf, hep_waveform):
+
+    t0 = ecg_epoch["t0_s"]
+    t1 = ecg_epoch["t1_s"]
+
+    a, b = int(t0 * sf), int(t1 * sf)
+
+    # --- EEG ---
+    eeg = eeg_filtered[a:b] * 1e6
+    time = np.arange(a, b) / sf
+
+    # --- R-peaks (convert relative → global) ---
+    if ecg_epoch is not None and "rpeaks" in ecg_epoch:
+        rpeaks_global = np.array(ecg_epoch["rpeaks"]) + a
+        rpeaks = rpeaks_global[(rpeaks_global >= a) & (rpeaks_global < b)]
+    else:
+        rpeaks = np.array([])
+
+    # --- Heart rate ---
+    hr = ecg_epoch["hr_mean_bpm"] if ecg_epoch is not None and "hr_mean_bpm" in ecg_epoch else np.nan
+
+    # --- FIGURE ---
+    fig, axs = plt.subplots(3, 1, figsize=(12, 8))
+
+    # -------- EEG --------
+    axs[0].plot(time, eeg, label="EEG")
+
+    if len(rpeaks) > 0:
+        axs[0].scatter(rpeaks / sf,
+                       eeg_filtered[rpeaks] * 1e6,
+                       s=10, label="R-peaks")
+
+    axs[0].set_ylabel("EEG (µV)")
+    axs[0].set_title(f"Epoch {t0:.1f}s – {t1:.1f}s")
+    axs[0].legend()
+
+    # -------- HEART RATE --------
+    if not np.isnan(hr):
+        axs[1].hlines(hr, t0, t1)
+    axs[1].set_ylabel("HR (bpm)")
+
+    # -------- HEP waveform --------
+    if hep_waveform is not None:
+
+        t_hep = np.linspace(-0.2, 0.6, len(hep_waveform))
+
+        axs[2].plot(t_hep, hep_waveform)
+        axs[2].axvline(0, linestyle="--")
+
+        axs[2].set_xlabel("Time (s) relative to R-peak")
+        axs[2].set_ylabel("HEP (µV)")
+
+    plt.tight_layout()
+    plt.show()
