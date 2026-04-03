@@ -1155,7 +1155,7 @@ def plot_epoch_hep_eeg_hr(eeg_filtered,ecg_epoch, sf, hep_waveform):
     hr = ecg_epoch["hr_mean_bpm"] if ecg_epoch is not None and "hr_mean_bpm" in ecg_epoch else np.nan
 
     # --- FIGURE ---
-    fig, axs = plt.subplots(3, 1, figsize=(12, 8))
+    fig, axs = plt.subplots(2, 1, figsize=(12, 8))
 
     # -------- EEG --------
     axs[0].plot(time, eeg, label="EEG")
@@ -1170,20 +1170,20 @@ def plot_epoch_hep_eeg_hr(eeg_filtered,ecg_epoch, sf, hep_waveform):
     axs[0].legend()
 
     # -------- HEART RATE --------
-    if not np.isnan(hr):
-        axs[1].hlines(hr, t0, t1)
-    axs[1].set_ylabel("HR (bpm)")
+    #if not np.isnan(hr):
+     #   axs[1].hlines(hr, t0, t1)
+    #axs[1].set_ylabel("HR (bpm)")
 
     # -------- HEP waveform --------
     if hep_waveform is not None:
 
         t_hep = np.linspace(-0.2, 0.6, len(hep_waveform))
 
-        axs[2].plot(t_hep, hep_waveform)
-        axs[2].axvline(0, linestyle="--")
+        axs[1].plot(t_hep, hep_waveform)
+        axs[1].axvline(0, linestyle="--")
 
-        axs[2].set_xlabel("Time (s) relative to R-peak")
-        axs[2].set_ylabel("HEP (µV)")
+        axs[1].set_xlabel("Time (s) relative to R-peak")
+        axs[1].set_ylabel("HEP (µV)")
 
     plt.tight_layout()
     plt.show()
