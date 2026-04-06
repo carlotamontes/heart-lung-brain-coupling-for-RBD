@@ -1,7 +1,7 @@
 import argparse
 import logging
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import h5py
 import mne
@@ -29,35 +29,24 @@ CONTROL_IDS = [
     "n01", "n02", "n03", "n04", "n05", "n09", "n10", "n11",
     "ins1", "ins2", "ins3", "ins4", "ins5", "ins6", "ins7", "ins8", "ins9",
 ]
-
 RBD_IDS = [
     "rbd02", "rbd03", "rbd05", "rbd07", "rbd08", "rbd09", "rbd10", "rbd11",
     "rbd12", "rbd13", "rbd17", "rbd18", "rbd19", "rbd21", "rbd22",
 ]
-
 PATIENT_GROUP = {pid: "Control" for pid in CONTROL_IDS}
 PATIENT_GROUP.update({pid: "RBD" for pid in RBD_IDS})
 
-STAGE_LABEL_MAP = {
-    "W": "Wake",
-    "S1": "N1",
-    "S2": "N2",
-    "S3": "N3",
-    "S4": "N3",
-    "R": "REM",
-}
-
-STAGE_ORDER = ["Wake", "N1", "N2", "N3", "REM"]
+STAGE_LABEL_MAP = {"W": "Wake", "S1": "N1", "S2": "N2", "S3": "N3", "S4": "N3", "R": "REM"}
+STAGE_ORDER = ["REM", "N1", "N2", "N3", "Wake"]
 
 
 def _safe_corr(x: Sequence[float], y: Sequence[float]) -> Dict[str, float]:
     xa = np.asarray(x, dtype=float)
     ya = np.asarray(y, dtype=float)
     mask = ~np.isnan(xa) & ~np.isnan(ya)
-    xa = xa[mask]
-    ya = ya[mask]
+    xa, ya = xa[mask], ya[mask]
 
-    if xa.size < 3 or np.all(xa == xa[0]) or np.all(ya == ya[0]):
+    if xa.size < 3 or np.allclose(xa, xa[0]) or np.allclose(ya, ya[0]):
         return {
             "pearson_r": np.nan,
             "pearson_p": np.nan,
@@ -65,18 +54,26 @@ def _safe_corr(x: Sequence[float], y: Sequence[float]) -> Dict[str, float]:
             "spearman_p": np.nan,
         }
 
-    pr, pp = pearsonr(xa, ya)
-    sr, sp = spearmanr(xa, ya)
+    p_r, p_p = pearsonr(xa, ya)
+    s_r, s_p = spearmanr(xa, ya)
     return {
-        "pearson_r": float(pr),
-        "pearson_p": float(pp),
-        "spearman_r": float(sr),
-        "spearman_p": float(sp),
+        "pearson_r": float(p_r),
+        "pearson_p": float(p_p),
+        "spearman_r": float(s_r),
+        "spearman_p": float(s_p),
     }
 
 
+def _rolling_corr(values_x: List[float], values_y: List[float], window_epochs: int) -> List[Dict[str, float]]:
+    corr = []
+    for i in range(len(values_x)):
+        start = max(0, i - window_epochs + 1)
+        corr.append(_safe_corr(values_x[start : i + 1], values_y[start : i + 1]))
+    return corr
+
+
 def _find_input_file(base_dir: Path, patient_id: str, suffixes: Tuple[str, ...]) -> Path:
-    candidates = []
+    candidates: List[Path] = []
     for suffix in suffixes:
         candidates.extend(base_dir.glob(f"{patient_id}*{suffix}"))
     if not candidates:
@@ -108,45 +105,28 @@ def _load_hypnogram(path: Path, epoch_seconds: int = 30) -> pd.DataFrame:
     if "onset_s" not in hyp.columns:
         hyp = add_epoch_onsets(hyp, epoch_len=epoch_seconds)
 
-    hyp = hyp[hyp["Sleep Stage"].isin(STAGE_ORDER)].reset_index(drop=True)
+    hyp = hyp[hyp["Sleep Stage"].isin(set(STAGE_ORDER))].reset_index(drop=True)
     return hyp[["Sleep Stage", "Duration[s]", "onset_s"]]
 
 
 def _stage_epochs_dict(hypnogram_df: pd.DataFrame) -> Dict[str, List[Tuple[float, float]]]:
-    out = {}
-    for stage in STAGE_ORDER:
-        out[stage] = compute_stage_epochs(hypnogram_df, stage)
-    return out
-
-
-def _epoch_rows(hypnogram_df: pd.DataFrame) -> List[Tuple[float, float, str]]:
-    rows = []
-    for _, row in hypnogram_df.iterrows():
-        t0 = float(row["onset_s"])
-        t1 = t0 + float(row["Duration[s]"])
-        rows.append((t0, t1, row["Sleep Stage"]))
-    return rows
+    return {stage: compute_stage_epochs(hypnogram_df, stage) for stage in STAGE_ORDER}
 
 
 def _expand_cpc_to_epochs(cpc_df: pd.DataFrame, n_epochs: int, window_epochs: int) -> pd.DataFrame:
-    out = pd.DataFrame({"epoch": np.arange(n_epochs), "HFC": np.nan, "LFC": np.nan, "LFC/HFC": np.nan})
+    out = pd.DataFrame({"epoch": np.arange(n_epochs), "hfc": np.nan, "lfc": np.nan, "ratio": np.nan})
     if cpc_df.empty:
         return out
 
     for _, row in cpc_df.iterrows():
         start = int(row["epoch"])
         end = min(start + window_epochs, n_epochs)
-        out.loc[start:end - 1, ["HFC", "LFC", "LFC/HFC"]] = [row.get("HFC", np.nan), row.get("LFC", np.nan), row.get("LFC/HFC", np.nan)]
+        out.loc[start : end - 1, ["hfc", "lfc", "ratio"]] = [
+            row.get("HFC", np.nan),
+            row.get("LFC", np.nan),
+            row.get("LFC/HFC", np.nan),
+        ]
     return out
-
-
-def _rolling_corr(values_x: List[float], values_y: List[float], window_epochs: int) -> List[Dict[str, float]]:
-    output = []
-    for i in range(len(values_x)):
-        a = max(0, i - window_epochs + 1)
-        corr = _safe_corr(values_x[a:i + 1], values_y[a:i + 1])
-        output.append(corr)
-    return output
 
 
 def process_patient(
@@ -160,218 +140,224 @@ def process_patient(
 ) -> None:
     group = PATIENT_GROUP.get(patient_id, "Unknown")
 
-    logging.info("[%s] Loading EDF: %s", patient_id, edf_path)
     raw = mne.io.read_raw_edf(edf_path, preload=True, verbose=False)
-
-    logging.info("[%s] Loading hypnogram: %s", patient_id, hypnogram_path)
-    hypnogram_df = _load_hypnogram(hypnogram_path, epoch_seconds=epoch_seconds)
-    epoch_timeline = _epoch_rows(hypnogram_df)
-    stage_epochs = _stage_epochs_dict(hypnogram_df)
-
     sf = float(raw.info["sfreq"])
 
-    logging.info("[%s] Preprocessing EEG/ECG", patient_id)
-    eeg_filtered = preprocess_eeg(raw)
+    hypnogram = _load_hypnogram(hypnogram_path, epoch_seconds)
+    timeline = []
+    for _, row in hypnogram.iterrows():
+        t0 = float(row["onset_s"])
+        t1 = t0 + float(row["Duration[s]"])
+        timeline.append((t0, t1, row["Sleep Stage"]))
+
+    epochs_only = [(t0, t1) for t0, t1, _ in timeline]
+
+    eeg = preprocess_eeg(raw)
     ecg_clean = preprocess_ecg(raw)
     ecg_raw = raw.get_data(picks="ECG1-ECG2")[0]
 
-    epochs_only = [(t0, t1) for t0, t1, _ in epoch_timeline]
-
-    logging.info("[%s] ECG epoch features", patient_id)
     ecg_epoch_df = extract_ecg_per_epoch(ecg_raw, ecg_clean, epochs_only, sf, detect_peaks=True)
     hrv_df = hrv_per_epoch(ecg_clean, epochs_only, sf)
 
-    logging.info("[%s] CPC features", patient_id)
     resp = extract_resp_from_ecg(ecg_clean, sf)
     cpc_df = hpc_metric(ecg_clean, resp, epochs_only, sf, window_epochs=cpc_window_epochs)
     cpc_epoch_df = _expand_cpc_to_epochs(cpc_df, n_epochs=len(epochs_only), window_epochs=cpc_window_epochs)
 
-    logging.info("[%s] EEG bandpower", patient_id)
-    bandpower_df = eeg_bandpower(eeg_filtered, stage_epochs, sf)
+    bandpower_df = eeg_bandpower(eeg, _stage_epochs_dict(hypnogram), sf)
+    bp_map = {
+        (float(r["start_s"]), str(r["stage"])): {
+            "delta": float(r.get("delta_power", np.nan)),
+            "theta": float(r.get("theta_power", np.nan)),
+            "alpha": float(r.get("alpha_power", np.nan)),
+            "beta": float(r.get("beta_power", np.nan)),
+            "gamma": float(r.get("gamma_power", np.nan)),
+        }
+        for _, r in bandpower_df.iterrows()
+    }
 
-    # Build per-epoch baseline table
-    epoch_df = pd.DataFrame({
-        "epoch": np.arange(len(epoch_timeline)),
-        "patient_id": patient_id,
-        "group": group,
-        "epoch_start_time": [x[0] for x in epoch_timeline],
-        "epoch_end_time": [x[1] for x in epoch_timeline],
-        "sleep_stage": [x[2] for x in epoch_timeline],
-    })
+    hrv_map = {
+        int(r["epoch"]): {
+            "n_beats": float(r.get("n_beats", np.nan)),
+            "hr_mean_bpm": float(r.get("hr_mean_bpm", np.nan)),
+            "rmssd": float(r.get("rmssd_ms", np.nan)),
+            "sdnn": float(r.get("sdnn_ms", np.nan)),
+            "pnn50": float(r.get("pnn50_pct", np.nan)),
+        }
+        for _, r in hrv_df.iterrows()
+    }
 
-    # Merge bandpower (stage + start_s based)
-    bp_merge = bandpower_df.rename(columns={"start_s": "epoch_start_time", "stage": "sleep_stage"})
-    epoch_df = epoch_df.merge(
-        bp_merge[["epoch_start_time", "sleep_stage", "delta_power", "theta_power", "alpha_power", "beta_power", "gamma_power"]],
-        on=["epoch_start_time", "sleep_stage"],
-        how="left",
-    )
+    cpc_map = {
+        int(r["epoch"]): {
+            "hfc": float(r.get("hfc", np.nan)),
+            "lfc": float(r.get("lfc", np.nan)),
+            "ratio": float(r.get("ratio", np.nan)),
+        }
+        for _, r in cpc_epoch_df.iterrows()
+    }
 
-    # Merge HRV and CPC
-    epoch_df = epoch_df.merge(
-        hrv_df[["epoch", "n_beats", "hr_mean_bpm", "rmssd_ms", "sdnn_ms", "pnn50_pct"]],
-        on="epoch",
-        how="left",
-    )
-    epoch_df = epoch_df.merge(cpc_epoch_df, on="epoch", how="left")
+    hep30_list: List[float] = []
+    delta30_list: List[float] = []
+    epoch_payload = []
 
-    # Per-epoch HEP/Delta (1s and 30s metrics + correlations)
-    hep_30s_values: List[float] = []
-    delta_30s_values: List[float] = []
-    one_sec_corrs: List[Dict[str, float]] = []
-    hep_stage_acc: Dict[str, List[float]] = {k: [] for k in STAGE_ORDER}
-    delta_stage_acc: Dict[str, List[float]] = {k: [] for k in STAGE_ORDER}
-    per_epoch_payload: List[Dict[str, object]] = []
+    stage_1s_hep: Dict[str, List[float]] = {s: [] for s in STAGE_ORDER}
+    stage_1s_delta: Dict[str, List[float]] = {s: [] for s in STAGE_ORDER}
+    stage_30s_hep: Dict[str, List[float]] = {s: [] for s in STAGE_ORDER}
+    stage_30s_delta: Dict[str, List[float]] = {s: [] for s in STAGE_ORDER}
 
-    logging.info("[%s] HEP + Delta features", patient_id)
-    for idx, row in epoch_df.iterrows():
-        ecg_epoch_row = ecg_epoch_df.iloc[idx] if idx < len(ecg_epoch_df) else None
-        stage = row["sleep_stage"]
+    for i, (t0, t1, stage) in enumerate(timeline):
+        ecg_row = ecg_epoch_df.iloc[i] if i < len(ecg_epoch_df) else None
 
-        hep_values = hep_metric(eeg_filtered, ecg_epoch_row, sf) if ecg_epoch_row is not None else None
-        delta_values = delta_power_1s(eeg_filtered, (row["epoch_start_time"], row["epoch_end_time"]), sf)
+        hep_1s_vals = hep_metric(eeg, ecg_row, sf) if ecg_row is not None else None
+        delta_1s_vals = delta_power_1s(eeg, (t0, t1), sf)
+        hep_1s_vals = [] if hep_1s_vals is None else list(np.asarray(hep_1s_vals, dtype=float))
+        delta_1s_vals = [] if delta_1s_vals is None else list(np.asarray(delta_1s_vals, dtype=float))
 
-        if hep_values is None:
-            hep_values = []
-        if delta_values is None:
-            delta_values = []
+        n = min(len(hep_1s_vals), len(delta_1s_vals))
+        hep_1s_vals, delta_1s_vals = hep_1s_vals[:n], delta_1s_vals[:n]
+        corr_1s = _safe_corr(hep_1s_vals, delta_1s_vals)
 
-        n = min(len(hep_values), len(delta_values))
-        hep_values = list(np.asarray(hep_values[:n], dtype=float))
-        delta_values = list(np.asarray(delta_values[:n], dtype=float))
+        hep_30s = float(hep_metric_30s(eeg, ecg_row, sf)) if ecg_row is not None else np.nan
+        delta_30s = float(delta_power_30s(eeg, ecg_row, sf)) if ecg_row is not None else np.nan
+        hep30_list.append(hep_30s)
+        delta30_list.append(delta_30s)
 
-        corr_1s = _safe_corr(hep_values, delta_values)
-        one_sec_corrs.append(corr_1s)
+        stage_1s_hep[stage].extend(hep_1s_vals)
+        stage_1s_delta[stage].extend(delta_1s_vals)
+        stage_30s_hep[stage].append(hep_30s)
+        stage_30s_delta[stage].append(delta_30s)
 
-        hep30 = float(hep_metric_30s(eeg_filtered, ecg_epoch_row, sf)) if ecg_epoch_row is not None else np.nan
-        delta30 = float(delta_power_30s(eeg_filtered, ecg_epoch_row, sf)) if ecg_epoch_row is not None else np.nan
-        hep_30s_values.append(hep30)
-        delta_30s_values.append(delta30)
-
-        hep_stage_acc[stage].extend(hep_values)
-        delta_stage_acc[stage].extend(delta_values)
-
-        per_epoch_payload.append(
+        epoch_payload.append(
             {
-                "epoch_index": int(row["epoch"]),
-                "epoch_start_time": float(row["epoch_start_time"]),
-                "epoch_end_time": float(row["epoch_end_time"]),
+                "epoch_index": i + 1,
+                "start_time": t0,
+                "end_time": t1,
                 "sleep_stage": stage,
-                "hep_values_1s": np.asarray(hep_values, dtype=float),
-                "delta_values_1s": np.asarray(delta_values, dtype=float),
-                "corr_1s": corr_1s,
+                "bandpower": bp_map.get((t0, stage), {"delta": np.nan, "theta": np.nan, "alpha": np.nan, "beta": np.nan, "gamma": np.nan}),
+                "hrv": hrv_map.get(i, {"n_beats": np.nan, "hr_mean_bpm": np.nan, "rmssd": np.nan, "sdnn": np.nan, "pnn50": np.nan}),
+                "cpc": cpc_map.get(i, {"hfc": np.nan, "lfc": np.nan, "ratio": np.nan}),
+                "hep_1s_corr": corr_1s,
             }
         )
 
-    corr30 = _rolling_corr(hep_30s_values, delta_30s_values, window_epochs=corr30_window_epochs)
+    corr30_list = _rolling_corr(hep30_list, delta30_list, window_epochs=corr30_window_epochs)
 
-    epoch_df["pearson_r_1s"] = [x["pearson_r"] for x in one_sec_corrs]
-    epoch_df["pearson_p_1s"] = [x["pearson_p"] for x in one_sec_corrs]
-    epoch_df["spearman_r_1s"] = [x["spearman_r"] for x in one_sec_corrs]
-    epoch_df["spearman_p_1s"] = [x["spearman_p"] for x in one_sec_corrs]
-    epoch_df["hep_30s_amplitude"] = hep_30s_values
-    epoch_df["delta_30s_power"] = delta_30s_values
-    epoch_df["pearson_r_30s"] = [x["pearson_r"] for x in corr30]
-    epoch_df["pearson_p_30s"] = [x["pearson_p"] for x in corr30]
-    epoch_df["spearman_r_30s"] = [x["spearman_r"] for x in corr30]
-    epoch_df["spearman_p_30s"] = [x["spearman_p"] for x in corr30]
-
-    # Sleep-stage correlation CSV
-    stage_corr_rows = []
+    stage_summary: Dict[str, Dict[str, float]] = {}
     for stage in STAGE_ORDER:
-        metrics = _safe_corr(hep_stage_acc[stage], delta_stage_acc[stage])
-        stage_corr_rows.append(
-            {
-                "patient_id": patient_id,
-                "group": group,
-                "sleep_stage": stage,
-                **metrics,
-            }
-        )
-    stage_corr_df = pd.DataFrame(stage_corr_rows)
+        c1 = _safe_corr(stage_1s_hep[stage], stage_1s_delta[stage])
+        c30 = _safe_corr(stage_30s_hep[stage], stage_30s_delta[stage])
+        stage_summary[stage] = {
+            "pearson_1s_r": c1["pearson_r"],
+            "pearson_1s_p": c1["pearson_p"],
+            "spearman_1s_r": c1["spearman_r"],
+            "spearman_1s_p": c1["spearman_p"],
+            "pearson_30s_r": c30["pearson_r"],
+            "pearson_30s_p": c30["pearson_p"],
+            "spearman_30s_r": c30["spearman_r"],
+            "spearman_30s_p": c30["spearman_p"],
+        }
 
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    epoch_csv = output_dir / f"{patient_id}_epochs.csv"
-    stage_csv = output_dir / f"{patient_id}_stage_correlations.csv"
     h5_path = output_dir / f"{patient_id}.h5"
 
-    epoch_df.to_csv(epoch_csv, index=False)
-    stage_corr_df.to_csv(stage_csv, index=False)
-
-    logging.info("[%s] Writing HDF5: %s", patient_id, h5_path)
     with h5py.File(h5_path, "w") as h5f:
-        patient_group = h5f.create_group(patient_id)
-        epochs_group = patient_group.create_group("Epochs")
+        patient_grp = h5f.create_group(patient_id)
+        patient_grp.create_dataset("Group", data=np.bytes_(group))
 
-        for payload, corr30_epoch in zip(per_epoch_payload, corr30):
-            grp = epochs_group.create_group(f"Epoch_{payload['epoch_index'] + 1}")
-            grp.create_dataset("Epoch Start Time", data=payload["epoch_start_time"])
-            grp.create_dataset("Epoch End Time", data=payload["epoch_end_time"])
-            grp.create_dataset("sleep stage", data=np.string_(payload["sleep_stage"]))
+        epochs_grp = patient_grp.create_group("epochs")
+        for ep, corr30 in zip(epoch_payload, corr30_list):
+            ep_grp = epochs_grp.create_group(f"epoch_{ep['epoch_index']:04d}")
+            ep_grp.create_dataset("start_time", data=float(ep["start_time"]))
+            ep_grp.create_dataset("end_time", data=float(ep["end_time"]))
+            ep_grp.create_dataset("sleep_stage", data=np.bytes_(ep["sleep_stage"]))
 
-            grp.create_dataset("HEP values 1 second window", data=payload["hep_values_1s"])
-            grp.create_dataset("Delta power 1 second window", data=payload["delta_values_1s"])
+            bp_grp = ep_grp.create_group("eeg_bandpower")
+            bp_grp.create_dataset("delta", data=ep["bandpower"]["delta"])
+            bp_grp.create_dataset("theta", data=ep["bandpower"]["theta"])
+            bp_grp.create_dataset("alpha", data=ep["bandpower"]["alpha"])
+            bp_grp.create_dataset("beta", data=ep["bandpower"]["beta"])
+            bp_grp.create_dataset("gamma", data=ep["bandpower"]["gamma"])
 
-            grp.create_dataset("Pearson correlation pearson_r 1 second window", data=payload["corr_1s"]["pearson_r"])
-            grp.create_dataset("Pearson correlation pearson_p 1 second window", data=payload["corr_1s"]["pearson_p"])
-            grp.create_dataset("Spearman correlation spearman_r 1 second window", data=payload["corr_1s"]["spearman_r"])
-            grp.create_dataset("Spearman correlation spearman_p 1 second window", data=payload["corr_1s"]["spearman_p"])
+            hrv_grp = ep_grp.create_group("hrv")
+            hrv_grp.create_dataset("n_beats", data=ep["hrv"]["n_beats"])
+            hrv_grp.create_dataset("hr_mean_bpm", data=ep["hrv"]["hr_mean_bpm"])
+            hrv_grp.create_dataset("rmssd", data=ep["hrv"]["rmssd"])
+            hrv_grp.create_dataset("sdnn", data=ep["hrv"]["sdnn"])
+            hrv_grp.create_dataset("pnn50", data=ep["hrv"]["pnn50"])
 
-            grp.create_dataset("Pearson correlation pearson_r 30 second window", data=corr30_epoch["pearson_r"])
-            grp.create_dataset("Pearson correlation pearson_p 30 second window", data=corr30_epoch["pearson_p"])
-            grp.create_dataset("Spearman correlation spearman_r 30 second window", data=corr30_epoch["spearman_r"])
-            grp.create_dataset("Spearman correlation spearman_p 30 second window", data=corr30_epoch["spearman_p"])
+            cpc_grp = ep_grp.create_group("cpc")
+            cpc_grp.create_dataset("hfc", data=ep["cpc"]["hfc"])
+            cpc_grp.create_dataset("lfc", data=ep["cpc"]["lfc"])
+            cpc_grp.create_dataset("ratio", data=ep["cpc"]["ratio"])
 
-    logging.info("[%s] Done. Files: %s | %s | %s", patient_id, epoch_csv.name, stage_csv.name, h5_path.name)
+            hep_grp = ep_grp.create_group("hep")
+            hep_grp.create_dataset("pearson_1s_r", data=ep["hep_1s_corr"]["pearson_r"])
+            hep_grp.create_dataset("pearson_1s_p", data=ep["hep_1s_corr"]["pearson_p"])
+            hep_grp.create_dataset("spearman_1s_r", data=ep["hep_1s_corr"]["spearman_r"])
+            hep_grp.create_dataset("spearman_1s_p", data=ep["hep_1s_corr"]["spearman_p"])
+            hep_grp.create_dataset("pearson_30s_r", data=corr30["pearson_r"])
+            hep_grp.create_dataset("pearson_30s_p", data=corr30["pearson_p"])
+            hep_grp.create_dataset("spearman_30s_r", data=corr30["spearman_r"])
+            hep_grp.create_dataset("spearman_30s_p", data=corr30["spearman_p"])
+
+        stage_grp = patient_grp.create_group("stage_summary")
+        for stage in STAGE_ORDER:
+            sg = stage_grp.create_group(stage)
+            corr_grp = sg.create_group("hep_delta_correlation")
+            corr = stage_summary[stage]
+            corr_grp.create_dataset("pearson_1s_r", data=corr["pearson_1s_r"])
+            corr_grp.create_dataset("pearson_1s_p", data=corr["pearson_1s_p"])
+            corr_grp.create_dataset("spearman_1s_r", data=corr["spearman_1s_r"])
+            corr_grp.create_dataset("spearman_1s_p", data=corr["spearman_1s_p"])
+            corr_grp.create_dataset("pearson_30s_r", data=corr["pearson_30s_r"])
+            corr_grp.create_dataset("pearson_30s_p", data=corr["pearson_30s_p"])
+            corr_grp.create_dataset("spearman_30s_r", data=corr["spearman_30s_r"])
+            corr_grp.create_dataset("spearman_30s_p", data=corr["spearman_30s_p"])
+
+    logging.info("[%s] Wrote %s", patient_id, h5_path)
 
 
 def _parse_patients(arg_patients: Optional[Sequence[str]]) -> List[str]:
-    if arg_patients:
-        return list(arg_patients)
-    return CONTROL_IDS + RBD_IDS
+    return list(arg_patients) if arg_patients else CONTROL_IDS + RBD_IDS
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="Export per-patient epoch features to CSV and HDF5.")
-    parser.add_argument("--edf-dir", type=Path, required=True, help="Directory with EDF files.")
-    parser.add_argument("--hypnogram-dir", type=Path, required=True, help="Directory with hypnogram CSV/TSV files.")
-    parser.add_argument("--output-dir", type=Path, required=True, help="Output directory for CSV/HDF5 files.")
-    parser.add_argument("--patients", nargs="*", default=None, help="Patient IDs to process. Default: all listed controls + RBD.")
+    parser = argparse.ArgumentParser(description="Generate one HDF5 file per patient with epoch and stage summaries.")
+    parser.add_argument("--edf-dir", type=Path, required=True)
+    parser.add_argument("--hypnogram-dir", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--patients", nargs="*", default=None)
     parser.add_argument("--epoch-seconds", type=int, default=30)
     parser.add_argument("--cpc-window-epochs", type=int, default=5)
     parser.add_argument("--corr30-window-epochs", type=int, default=30)
     parser.add_argument("--log-level", default="INFO")
-
     args = parser.parse_args(argv)
 
-    logging.basicConfig(level=getattr(logging, str(args.log_level).upper(), logging.INFO), format="%(asctime)s | %(levelname)s | %(message)s")
+    logging.basicConfig(
+        level=getattr(logging, str(args.log_level).upper(), logging.INFO),
+        format="%(asctime)s | %(levelname)s | %(message)s",
+    )
 
-    patients = _parse_patients(args.patients)
-    failures = []
-
-    for patient_id in patients:
+    failures: List[str] = []
+    for patient_id in _parse_patients(args.patients):
         try:
-            edf_path = _find_input_file(args.edf_dir, patient_id, (".edf", ".EDF"))
-            hyp_path = _find_input_file(args.hypnogram_dir, patient_id, (".csv", ".CSV", ".tsv", ".TSV", ".txt", ".TXT"))
+            edf = _find_input_file(args.edf_dir, patient_id, (".edf", ".EDF"))
+            hyp = _find_input_file(args.hypnogram_dir, patient_id, (".csv", ".CSV", ".tsv", ".TSV", ".txt", ".TXT"))
             process_patient(
                 patient_id=patient_id,
-                edf_path=edf_path,
-                hypnogram_path=hyp_path,
+                edf_path=edf,
+                hypnogram_path=hyp,
                 output_dir=args.output_dir,
                 epoch_seconds=args.epoch_seconds,
                 cpc_window_epochs=args.cpc_window_epochs,
                 corr30_window_epochs=args.corr30_window_epochs,
             )
-        except Exception as exc:  # continue processing other patients
+        except Exception as exc:
             logging.exception("[%s] Failed: %s", patient_id, exc)
             failures.append(patient_id)
 
     if failures:
-        logging.warning("Completed with failures (%d/%d): %s", len(failures), len(patients), ", ".join(failures))
+        logging.warning("Completed with failures (%d): %s", len(failures), ", ".join(failures))
         return 1
-
-    logging.info("All patients processed successfully (%d).", len(patients))
     return 0
 
 
