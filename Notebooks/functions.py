@@ -971,7 +971,7 @@ def hep_metric_30s(eeg_filtered, epoch, sf, min_rr_s=0.88, amplitude_threshold_u
         baseline = segment[:, :r_idx].mean(axis=1, keepdims=True)
         segment = segment - baseline
 
-        # 🔴 peak amplitude per beat
+        # peak amplitude per beat
         peak_amp = np.max(np.abs(segment))
         hep_peaks.append(peak_amp)
 
@@ -980,7 +980,7 @@ def hep_metric_30s(eeg_filtered, epoch, sf, min_rr_s=0.88, amplitude_threshold_u
 
     hep_peaks = np.array(hep_peaks) * 1e6  # V → µV
 
-    # 🔴 final 30s value
+    # final 30s value
     return float(np.mean(hep_peaks))
 
 def delta_power_30s(eeg_filtered, epoch, sf):
