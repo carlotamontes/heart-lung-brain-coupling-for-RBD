@@ -210,8 +210,7 @@ def process_patient_to_hdf5(
     ecg_clean    = preprocess_ecg(raw)
 
     # 3. GET EPOCHS PER STAGE
-    epoch_len = 30 
-    df = add_epoch_onsets(df, epoch_len)
+    epoch_len = 30
 
     # convert df → epoch list
     epochs = []
@@ -225,6 +224,30 @@ def process_patient_to_hdf5(
         "S3": "N3",
         "S4": "N3"
     }
+
+    # Keep only stage-scoring rows that map cleanly to full 30 s epochs in the EDF.
+    df = df.copy()
+
+    if "Event" in df.columns:
+        sleep_event_mask = df["Event"].astype(str).str.startswith("SLEEP-", na=False)
+        if sleep_event_mask.any():
+            df = df.loc[sleep_event_mask].copy()
+
+    if "Duration[s]" in df.columns:
+        durations = pd.to_numeric(df["Duration[s]"], errors="coerce")
+        df = df.loc[np.isclose(durations, epoch_len)].copy()
+        df["Duration[s]"] = durations.loc[df.index]
+
+    df = df.loc[df["Sleep Stage"].astype(str).isin(stage_map)].copy()
+    df = df.reset_index(drop=True)
+    df = add_epoch_onsets(df, epoch_len)
+
+    raw_duration_s = raw.n_times / sf
+    df = df.loc[(df["onset_s"] + epoch_len) <= (raw_duration_s + 1e-9)].copy()
+    df = df.reset_index(drop=True)
+
+    if df.empty:
+        raise ValueError("No valid 30 s sleep-stage epochs remain after filtering the hypnogram.")
 
     for _, row in df.iterrows():
             t0 = row["onset_s"]
@@ -248,8 +271,8 @@ def process_patient_to_hdf5(
 
     resp = extract_resp_from_ecg(ecg_clean, sf)
 
-    cpc_df = hpc_metric(ecg_clean, resp, epochs_tuples, sf, window_epochs=5)
-
+    cpc_window_epochs = 5
+    cpc_df = hpc_metric(ecg_clean, resp, epochs_tuples, sf, window_epochs=cpc_window_epochs)
 
 
     stage_epochs_dict = {
@@ -316,7 +339,8 @@ def process_patient_to_hdf5(
             # ---- CPC INFO ----
             cpc_group = ep_group.require_group("cpc")
 
-            row = cpc_df[cpc_df["epoch"] == i]
+            cpc_epoch = i - (i % cpc_window_epochs)
+            row = cpc_df[cpc_df["epoch"] == cpc_epoch]
 
             if not row.empty:
                 row = row.iloc[0]
@@ -340,9 +364,21 @@ def process_patient_to_hdf5(
                     sf=sf,
                 )
 
-                if hep_1s is not None and delta_1s is not None and len(hep_1s) > 1:
-                    r_p, p_p = pearsonr(hep_1s, delta_1s)
-                    r_s, p_s = spearmanr(hep_1s, delta_1s)
+                if hep_1s is not None and delta_1s is not None:
+                    hep_arr = np.asarray(hep_1s, dtype=float)
+                    delta_arr = np.asarray(delta_1s, dtype=float)
+
+                    n_common = min(len(hep_arr), len(delta_arr))
+                    hep_arr = hep_arr[:n_common]
+                    delta_arr = delta_arr[:n_common]
+
+                    valid_mask = np.isfinite(hep_arr) & np.isfinite(delta_arr)
+
+                    if valid_mask.sum() >= 3:
+                        r_p, p_p = pearsonr(hep_arr[valid_mask], delta_arr[valid_mask])
+                        r_s, p_s = spearmanr(hep_arr[valid_mask], delta_arr[valid_mask])
+                    else:
+                        r_p = p_p = r_s = p_s = np.nan
                 else:
                     r_p = p_p = r_s = p_s = np.nan
 
