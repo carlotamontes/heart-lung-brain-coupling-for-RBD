@@ -47,6 +47,37 @@ def add_epoch_onsets(df, epoch_len):
     df["onset_s"] = np.arange(len(df)) * epoch_len
     return df
 
+def prepare_sleep_stage_dataframe(df, epoch_len, raw_duration_s=None,
+                                  valid_stages=("W", "R", "S1", "S2", "S3", "S4")):
+    # Filter the hypnogram to rows that map cleanly to contiguous 30 s sleep-stage epochs.
+    # This avoids assigning onset times to non-scoring rows and prevents epochs from
+    # extending beyond the EDF duration.
+    df = df.copy()
+
+    if "Event" in df.columns:
+        sleep_event = df["Event"].astype(str).str.strip()
+        sleep_event_mask = sleep_event.str.startswith("SLEEP-", na=False)
+        if sleep_event_mask.any():
+            df = df.loc[sleep_event_mask].copy()
+
+    if "Duration[s]" in df.columns:
+        durations = pd.to_numeric(df["Duration[s]"], errors="coerce")
+        df = df.loc[np.isclose(durations, epoch_len)].copy()
+        df["Duration[s]"] = durations.loc[df.index]
+
+    sleep_stage = df["Sleep Stage"].astype(str).str.strip()
+    df = df.loc[sleep_stage.isin(valid_stages)].copy()
+    df["Sleep Stage"] = sleep_stage.loc[df.index]
+
+    df = df.reset_index(drop=True)
+    df = add_epoch_onsets(df, epoch_len)
+
+    if raw_duration_s is not None:
+        df = df.loc[(df["onset_s"] + epoch_len) <= (raw_duration_s + 1e-9)].copy()
+        df = df.reset_index(drop=True)
+
+    return df
+
 def pick_core_channels(raw):
     # select only the core channels (F4-C4 for EEG and ECG1-ECG2 for ECG) for further analysis
     core_chs = ["F4-C4", "ECG1-ECG2"]
@@ -340,6 +371,58 @@ def hrv_per_epoch(ecg, epochs, sf):
 
     return pd.DataFrame(rows)
 
+def extract_eeg_amplitude_at_rpeaks(eeg_filtered, epoch, sf, unit="uv"):
+    # Extract the EEG amplitude exactly at each R-peak sample for one epoch.
+    # Input:
+        # eeg_filtered : full EEG signal (1D, Volts)
+        # epoch : row containing t0_s and rpeaks (relative to the epoch)
+        # sf : sampling frequency (Hz)
+        # unit : "uv" to return microvolts, "v" to return volts
+    # Output:
+        # DataFrame with one row per R-peak and the EEG amplitude at that sample
+
+    amplitude_col = "eeg_amplitude_uv" if str(unit).lower() == "uv" else "eeg_amplitude_v"
+    columns = [
+        "beat",
+        "rpeak_sample_epoch",
+        "rpeak_sample_global",
+        "rpeak_time_epoch_s",
+        "rpeak_time_global_s",
+        amplitude_col,
+    ]
+
+    if epoch is None or "rpeaks" not in epoch or epoch["rpeaks"] is None:
+        return pd.DataFrame(columns=columns)
+
+    t0 = epoch["t0_s"]
+    a = int(t0 * sf)
+
+    rpeaks_epoch = np.asarray(epoch["rpeaks"], dtype=int)
+    if rpeaks_epoch.size == 0:
+        return pd.DataFrame(columns=columns)
+
+    rpeaks_global = rpeaks_epoch + a
+    valid = (rpeaks_global >= 0) & (rpeaks_global < len(eeg_filtered))
+
+    rpeaks_epoch = rpeaks_epoch[valid]
+    rpeaks_global = rpeaks_global[valid]
+
+    if rpeaks_global.size == 0:
+        return pd.DataFrame(columns=columns)
+
+    amplitudes = np.asarray(eeg_filtered)[rpeaks_global].astype(float)
+    if str(unit).lower() == "uv":
+        amplitudes = amplitudes * 1e6
+
+    return pd.DataFrame({
+        "beat": np.arange(1, len(rpeaks_global) + 1),
+        "rpeak_sample_epoch": rpeaks_epoch,
+        "rpeak_sample_global": rpeaks_global,
+        "rpeak_time_epoch_s": rpeaks_epoch / sf,
+        "rpeak_time_global_s": rpeaks_global / sf,
+        amplitude_col: amplitudes,
+    })
+
 def extract_resp_from_ecg(ecg, sf, method="neurokit"):
     # Estimate respiration signal from ECG~
 
@@ -501,8 +584,9 @@ def classify_sleep_stable_unstable(hpc_df):
     return df
 
 
-def hep_metric(eeg_filtered, epoch, sf, window_s=1.0, min_rr_s=0.88, amplitude_threshold_uv=100.0):
-    # Compute Heartbeat-Evoked Potentials (HEP) per 1-second window
+def hep_metric(eeg_filtered, epoch, sf, window_s=1.0, min_rr_s=0.80,
+               amplitude_threshold_uv=100.0):
+    # Compute a HEP-derived scalar per 1-second window.
     # Input:
         #  eeg_filtered : full EEG signal (1D, Volts)
         # epoch: row containing:
@@ -513,7 +597,7 @@ def hep_metric(eeg_filtered, epoch, sf, window_s=1.0, min_rr_s=0.88, amplitude_t
         # min_rr_s: minimum RR interval to avoid overlap
         # amplitude_threshold_uv : artifact rejection threshold
 
-    # Output: list of mean HEP amplitude values for each 1-second window within the epoch
+    # Output: list of scalar HEP values for each 1-second window within the epoch
 
     # 1. Convert epoch time → sample indices
     # 2. Align R-peaks to global EEG timeline
@@ -526,12 +610,14 @@ def hep_metric(eeg_filtered, epoch, sf, window_s=1.0, min_rr_s=0.88, amplitude_t
             # high-amplitude artifacts
         # d. Detrend signal
         # e. Baseline correction (-200ms to 0ms)
-        # f. Average across beats → HEP waveform
-        # g. Reduce to scalar (mean amplitude)
+        # f. Compute the peak absolute amplitude for each valid beat
+        # g. Reduce to one scalar as the mean of those per-beat peak amplitudes
     
     # HEP reflects cortical processing of cardiac signals:
     # higher amplitude → stronger brain–heart interaction
     # modulated by attention, sleep stage, autonomic state
+    # Using absolute peak amplitude makes positive and negative deflections
+    # contribute symmetrically to the final scalar.
 
     # epoch = ecg_R.iloc[1]
     tmin, tmax = -0.2, 0.6
@@ -545,15 +631,18 @@ def hep_metric(eeg_filtered, epoch, sf, window_s=1.0, min_rr_s=0.88, amplitude_t
 
     # get rpeaks for each epoch and store in a DataFrame
     rpeaks = epoch["rpeaks"]
+
     if rpeaks is None or len(rpeaks) < 2:
             return None
     
+    n_windows = int((b - a) / window_samples)
+
     # extract full EEG data as numpy array
     rpeaks_global = np.array(rpeaks) + a  # relative → global
     # = [100+7200, 450+7200, 800+7200]   (se sf=120 e t0=60s → a=7200)
     # = [7300, 7650, 8000]  ← posição real no sinal EEG completo
 
-    hep_values_scalar = [] # list of mean HEP amplitude values for each 1s window
+    hep_values_scalar = [] # list of HEP scalar values for each 1 s window
 
     rr_intervals = np.diff(rpeaks_global)  # em amostras
     
@@ -565,7 +654,6 @@ def hep_metric(eeg_filtered, epoch, sf, window_s=1.0, min_rr_s=0.88, amplitude_t
 
     # iterate over 1-second windows within the epoch
 
-    n_windows = int((b - a) / window_samples)
     # b-a = 15360 samples (30s epoch) / 512 Hz = 30s → 30 windows of 1s each 
     # window_samples = 512 samples (1s) → 30 windows of 512 samples each
     # n_windows = total_duration / 1 second = 15360 / 512 = 30 windows
@@ -587,8 +675,8 @@ def hep_metric(eeg_filtered, epoch, sf, window_s=1.0, min_rr_s=0.88, amplitude_t
             hep_values_scalar.append(np.nan)
             continue
         
-        # create hep segments for each Rpeak from -200 to +500 ms around the Rpeak
-        hep_segments = [] # shape (1, 410)
+        # store one peak-absolute-amplitude value per valid beat in the window
+        hep_peak_amps = []
         # 0.6 -(-0.2) = 0.8 -> 0.8 * 512 = 410
     
         # r is relative to the epoch start
@@ -598,7 +686,7 @@ def hep_metric(eeg_filtered, epoch, sf, window_s=1.0, min_rr_s=0.88, amplitude_t
             # Extract EEG segment around the R-peak
 
             seg_start = int(r + tmin * sf) # r - 200ms
-            seg_stop  = int(r + tmax * sf) # r + 500ms
+            seg_stop  = int(r + tmax * sf) # r + 600ms
 
             # r is the center of the extracted segment
             # it's the exact sample in eeg_filtered where the heartbeat occurred 
@@ -627,36 +715,24 @@ def hep_metric(eeg_filtered, epoch, sf, window_s=1.0, min_rr_s=0.88, amplitude_t
 
             # remove linear trends that could bias the average
             segment = detrend(segment, axis=1)  # axis=1 = along time
-            
-            # append the segments 
-            # (1, 410) → (n_beats, 410) 
-            hep_segments.append(segment)
 
-        # if all rpeaks on the 1s window are discarded then discard all window 
-        if len(hep_segments) == 0:
+            # Baseline correction using the pre-R interval (-200 ms to 0 ms).
+            r_idx = int(abs(tmin) * sf)
+            baseline = segment[:, :r_idx].mean(axis=1, keepdims=True)
+            segment = segment - baseline
+            
+            # Use the largest absolute deflection so positive and negative
+            # HEP components are treated the same way.
+            peak_amp = np.max(np.abs(segment))
+            hep_peak_amps.append(float(peak_amp))
+
+        # if all rpeaks on the 1 s window are discarded then discard the window
+        if len(hep_peak_amps) == 0:
             hep_values_scalar.append(np.nan)
             continue
 
-        hep_epochs = np.array(hep_segments)  
-        # shape (n_beats, 1, segment_samples) → (n_beats, segment_samples)
-
-        # Baseline corrections (-200ms a 0ms, modal value of paper)
-        r_idx    = int(abs(tmin) * sf)           # position of R-peak no segmento
-        bl_start = 0                             # -200ms (início do segmento)
-        bl_end   = r_idx                         # 0ms (R-peak)
-        # baseline shape (n_beats, 1, 1) → (n_beats, 1, segment_samples)
-        baseline = hep_epochs[:, :, bl_start:bl_end].mean(axis=2, keepdims=True) 
-        # baseline is the mean amplitude in the -200 to 0 ms window for each beat, used to correct for slow drifts in the EEG signal
-        hep_epochs = hep_epochs - baseline
-
-        # (3, 1, 410) → (1, 410)
-        # (n_beats, 1, n_samples) → (1, n_samples) → (n_samples,)
-        # average of the EEG amplitude across beats to get the HEP for that 1-second window
-        hep_avg = hep_epochs.mean(axis=0).squeeze()  # shape: (n_samples,)
-
-
-        # mean amplitude of the HEP in the -200 to +600 ms window 
-        hep_values_scalar.append(float(hep_avg.mean()) * 1e6)
+        # Final 1 s value: mean of per-beat peak absolute amplitudes.
+        hep_values_scalar.append(float(np.mean(hep_peak_amps)) * 1e6)
 
     return hep_values_scalar # list of floats (µV)
 
@@ -791,9 +867,16 @@ def HEP_Delta_HR_plot_new(eeg_filtered, ecg_R, epochs, sf, epoch_range):
     hr_values = []
 
     epoch_range = list(epoch_range)
+    valid_epoch_range = [i for i in epoch_range if 0 <= i < len(epochs)]
+
+    if len(valid_epoch_range) == 0:
+        raise ValueError(
+            f"No valid epoch indices were provided. "
+            f"Received {epoch_range}, but epochs has length {len(epochs)}."
+        )
 
     # iterating over the specified range of epochs
-    for i in epoch_range:
+    for i in valid_epoch_range:
         epoch = epochs[i] # (t0, t1) OR dict
         ecg_epoch = ecg_R.iloc[i] if i < len(ecg_R) else None # rpeaks + HR
 
@@ -836,7 +919,7 @@ def HEP_Delta_HR_plot_new(eeg_filtered, ecg_R, epochs, sf, epoch_range):
     ax3.set_ylabel("HR (bpm)", color="green")
     ax3.tick_params(axis='y', labelcolor="green")
 
-    plt.title(f"HEP + Delta + HR | Epochs {epoch_range[0]} to {epoch_range[-1]}")
+    plt.title(f"HEP + Delta + HR | Epochs {valid_epoch_range[0]} to {valid_epoch_range[-1]}")
     plt.tight_layout()
     plt.show()
 
@@ -910,8 +993,8 @@ def plot_hep_delta_correlation(hep_values, delta_vals):
     r_pearson,  p_pearson  = pearsonr(hep_clean, delta_clean)
     r_spearman, p_spearman = spearmanr(hep_clean, delta_clean)
 
-    print(f"Pearson:  r={r_pearson:.3f},  p={p_pearson:.3f}")
-    print(f"Spearman: r={r_spearman:.3f}, p={p_spearman:.3f}")
+    print(f"Pearson:  r={r_pearson:.10f},  p={p_pearson:.10f}")
+    print(f"Spearman: r={r_spearman:.10f}, p={p_spearman:.10f}")
 
     return {
         "pearson_r": r_pearson,
@@ -922,95 +1005,141 @@ def plot_hep_delta_correlation(hep_values, delta_vals):
 
 # create a function that hep_metric but for a 30s window
 
-def hep_metric_30s(eeg_filtered, epoch, sf, min_rr_s=0.88, amplitude_threshold_uv=100.0):
+def hep_metric_30s(eeg_filtered, epoch, sf, min_rr_s=0.80,
+                   amplitude_threshold_uv=100.0):
+    # Compute a single HEP-derived scalar for the full 30 s epoch using the same
+    # reduction rule as hep_metric(), but treating the entire epoch as one window.
+    
+    # 1. Align epoch-relative R-peaks to the global EEG timeline.
+    # 2. Extract EEG segments around each R-peak (-200 ms to +600 ms).
+    # 3. Reject beats with short RR intervals or large-amplitude artifacts.
+    # 4. Detrend and baseline-correct each segment.
+    # 5. Compute the peak absolute amplitude for each valid beat.
+    # 6. Reduce to one scalar as the mean of those per-beat peak amplitudes.
 
+    # inputs:
+        # eeg_filtered : full EEG signal (1D, Volts)
+        # epoch: row containing:
+            # t0_s, t1_s (epoch timing)
+            # rpeaks (relative to epoch)
+        # sf: sampling frequency
+        # min_rr_s: minimum RR interval to avoid overlap
+        # amplitude_threshold_uv : artifact rejection threshold
+    
+    # output: a single scalar HEP value for the entire 30 s epoch (µV)
+
+    # define a time window around each R-peak 
     tmin, tmax = -0.2, 0.6
 
+    # convert epoch start and end times from seconds to sample indices
     t0 = epoch["t0_s"]
     t1 = epoch["t1_s"]
 
+    # convert epoch start and end times from seconds to sample indices
+    # a = start sample of the epoch in the full EEG signal
+    # b= end sample of the epoch in the full EEG signal
     a, b = int(t0 * sf), int(t1 * sf)
 
+    # get the rpeaks for the epoch and align them to the global EEG timeline
     rpeaks = epoch["rpeaks"]
+
+    # if no R-peaks or only one R-peak is found, we cannot compute HEP, so return NaN
     if rpeaks is None or len(rpeaks) < 2:
         return np.nan
 
+    # convert relative R-peak indices to global sample indices in the full EEG signal
     rpeaks_global = np.array(rpeaks) + a
 
+    # compute RR intervals in samples to identify and exclude overlapping beats
     rr_intervals = np.diff(rpeaks_global)
     min_rr_samples = int(min_rr_s * sf)
 
+    # convert amplitude threshold from µV to V for comparison with the EEG signal
     amplitude_threshold = amplitude_threshold_uv * 1e-6
 
-    hep_peaks = []
+    hep_peak_amps = [] # to store the peak absolute amplitude of each valid beat in the epoch
 
     for i, r in enumerate(rpeaks_global):
-
+        # Extract EEG segment around the R-peak (from tmin to tmax)
         seg_start = int(r + tmin * sf)
         seg_stop  = int(r + tmax * sf)
 
+        # Check if the segment is within the bounds of the EEG signal
         if seg_start < 0 or seg_stop > len(eeg_filtered):
             continue
 
-        # RR filtering
+        # Skip beats followed by a very short RR interval to reduce overlap
+        # between consecutive heartbeat-locked EEG responses.
         if i < len(rr_intervals):
             if rr_intervals[i] < min_rr_samples:
                 continue
-
+        
+        # Extract the segment of the EEG signal around the R-peak
         segment = eeg_filtered[seg_start:seg_stop][None, :]
 
-        # artifact rejection
+        # Reject segments dominated by large EEG artifacts.
         if np.max(np.abs(segment)) > amplitude_threshold:
             continue
 
-        # detrend
+        # Remove slow linear drift within the extracted segment.
         segment = detrend(segment, axis=1)
 
-        # baseline correction (-200ms to 0ms)
+        # Baseline correction using the pre-R interval (-200 ms to 0 ms).
         r_idx = int(abs(tmin) * sf)
         baseline = segment[:, :r_idx].mean(axis=1, keepdims=True)
         segment = segment - baseline
 
-        # peak amplitude per beat
+        # Use the largest absolute deflection so positive and negative
+        # HEP components contribute symmetrically.
         peak_amp = np.max(np.abs(segment))
-        hep_peaks.append(peak_amp)
+        hep_peak_amps.append(float(peak_amp))
 
-    if len(hep_peaks) == 0:
+    if len(hep_peak_amps) == 0:
         return np.nan
 
-    hep_peaks = np.array(hep_peaks) * 1e6  # V → µV
-
-    # final 30s value
-    return float(np.mean(hep_peaks))
+    # Final 30 s value: mean of per-beat peak absolute amplitudes.
+    return float(np.mean(hep_peak_amps)) * 1e6
 
 def delta_power_30s(eeg_filtered, epoch, sf):
 
+    # Compute the relative delta power for one 30-second EEG epoch.
+    # Input:
+        # eeg_filtered : full EEG signal (1D, Volts)
+        # epoch: row containing t0_s and t1_s for the epoch (or tuple (t0, t1))
+        # sf: sampling frequency (Hz)
+    # Output: relative delta power (delta power / total power) for the 30-second epoch
+
+
+    # Read the epoch start and end times in seconds.
     t0 = epoch["t0_s"]
     t1 = epoch["t1_s"]
+
+    # Convert epoch time limits into sample indices in the full EEG signal.
     a, b = int(t0 * sf), int(t1 * sf)
 
+    # Check if the sample indices are valid and within the bounds of the EEG signal.
     if a < 0 or b > len(eeg_filtered) or a >= b:
         return np.nan
 
+    # Extract the EEG segment corresponding to the epoch.
     segment = eeg_filtered[a:b]
 
-    bands = {
-        "delta": (0.5, 4),
-        "theta": (4, 8),
-        "alpha": (8, 12),
-        "beta": (12, 30),
-        "gamma": (30, 40)
-    }
+    # Define the frequency bands of interest for power calculation.
+    bands = {"delta": (0.5, 4), "theta": (4, 8), "alpha": (8, 12), "beta": (12, 30), "gamma": (30, 40)}
 
+    # Compute the power spectral density (PSD) of the EEG segment using Welch's method.
     psd, freqs = psd_array_welch(segment[None, :], sfreq=sf, fmin=0.5, fmax=40.0, verbose=False)
-    psd = psd[0]
+    psd = psd[0] # shape (n_freqs,)
 
-    powers = {}
+    powers = {} # to store the integrated power for each frequency band
+    # Integrate the PSD over each frequency band to compute the power in that band.
     for name, (f1, f2) in bands.items():
         idx = (freqs >= f1) & (freqs <= f2)
         powers[name] = float(np.trapezoid(psd[idx], freqs[idx])) if np.any(idx) else 0.0
 
+    # Compute the total power across all bands and calculate the relative delta power.
     total_power = sum(powers.values())
+    # relative delta power is the proportion of total power that is in the delta band
     rel_delta = powers["delta"] / total_power if total_power > 0 else 0.0
 
     return rel_delta
@@ -1021,112 +1150,145 @@ def delta_power_30s(eeg_filtered, epoch, sf):
 # each value of the 410 arrat will be the mean of all the samples of the 40 peaks
 # for sample[1] we do the mean of the 40 sample [1] we got from the 40 r peaks 
 
-def hep_waveform_mean(eeg_filtered, epoch, sf,
-                      tmin=-0.2, tmax=0.6,
-                      min_rr_s=0.88,
-                      amplitude_threshold_uv=100.0):
+def hep_waveform_mean(eeg_filtered, epoch, sf, tmin=-0.2, tmax=0.6,  min_rr_s=0.88, amplitude_threshold_uv=100.0):
 
+    # Compute the average HEP waveform across all valid heartbeats within a 30-second epoch.
+    # Input:
+        # eeg_filtered : full EEG signal (1D, Volts)
+        # epoch: row containing t0_s and t1_s for the epoch (or tuple (t0, t1))
+        # sf: sampling frequency (Hz)
+        # tmin, tmax: time window around R-peaks (in seconds)
+        # min_rr_s: minimum RR interval (in seconds)
+        # amplitude_threshold_uv: threshold for rejecting artifacts (in µV)
+    # Output: average HEP waveform (1D array of length corresponding to tmin-tmax) in µV
+    # The output is therefore a waveform, not a scalar.
+
+    # Read the epoch start time and convert to sample index.
     t0 = epoch["t0_s"]
     a = int(t0 * sf)
 
+    # Get the R-peaks for the epoch and align them to the global EEG timeline.
     rpeaks = epoch["rpeaks"]
     if rpeaks is None or len(rpeaks) < 2:
         return None
 
+    # Convert relative R-peak indices to global sample indices in the full EEG signal.  
     rpeaks_global = np.array(rpeaks) + a
 
+    # Compute RR intervals in samples to identify and exclude overlapping beats.
     rr_intervals = np.diff(rpeaks_global)
-    min_rr_samples = int(min_rr_s * sf)
-    amplitude_threshold = amplitude_threshold_uv * 1e-6
+    min_rr_samples = int(min_rr_s * sf) # convert minimum RR interval from seconds to samples
+    amplitude_threshold = amplitude_threshold_uv * 1e-6 # convert amplitude threshold from µV to V for comparison with the EEG signal
 
-    segments = []
+    segments = [] # to store the valid EEG segments around each R-peak that will be averaged to create the HEP waveform
 
     for i, r in enumerate(rpeaks_global):
-
+        # Extract EEG segment around the R-peak (from tmin to tmax)
         seg_start = int(r + tmin * sf)
         seg_stop  = int(r + tmax * sf)
 
+        # Check if the segment is within the bounds of the EEG signal
         if seg_start < 0 or seg_stop > len(eeg_filtered):
             continue
-
+        
+        # Skip beats followed by a very short RR interval to reduce overlap between consecutive heartbeat-locked EEG responses.
         if i < len(rr_intervals):
             if rr_intervals[i] < min_rr_samples:
                 continue
 
+        # Extract the segment of the EEG signal around the R-peak
         segment = eeg_filtered[seg_start:seg_stop]
 
+        # Reject segments dominated by large EEG artifacts.
         if np.max(np.abs(segment)) > amplitude_threshold:
             continue
 
-        segment = detrend(segment)
+        segment = detrend(segment) # Remove slow linear drift within the extracted segment.
 
-        r_idx = int(abs(tmin) * sf)
-        baseline = segment[:r_idx].mean()
-        segment = segment - baseline
+        # Baseline correction using the pre-R interval (-200 ms to 0 ms).
+        r_idx = int(abs(tmin) * sf) # index corresponding to the R-peak in the segment (102 samples if tmin=-0.2s and sf=512Hz)
+        baseline = segment[:r_idx].mean() # mean of the pre-R interval to use as baseline
+        segment = segment - baseline # baseline correction by subtracting the baseline from the entire segment
 
         segments.append(segment)
 
-    if len(segments) == 0:
+    if len(segments) == 0: # if no valid segments were found, we cannot compute an average waveform, so return None
         return None
 
     segments = np.array(segments)  # shape (n_beats, 410)
 
-    # 🔵 MÉDIA por sample
+    # MEAN across beats (across rows) to get the average HEP waveform for the epoch
     hep_avg = np.mean(segments, axis=0)  # shape (410,)
 
     return hep_avg * 1e6  # µV
 
-def hep_waveform_max(eeg_filtered, epoch, sf,
-                     tmin=-0.2, tmax=0.6,
-                     min_rr_s=0.88,
-                     amplitude_threshold_uv=100.0):
+def hep_waveform_max(eeg_filtered, epoch, sf, tmin=-0.2, tmax=0.6, min_rr_s=0.88, amplitude_threshold_uv=100.0):
+    # Compute the maximum HEP waveform across all valid heartbeats within a 30-second epoch.
+    # Input:
+        # eeg_filtered : full EEG signal (1D, Volts)
+        # epoch: row containing t0_s and t1_s for the epoch (or tuple (t0, t1))
+        # sf: sampling frequency (Hz)
+        # tmin, tmax: time window around R-peaks (in seconds)
+        # min_rr_s: minimum RR interval (in seconds)
+        # amplitude_threshold_uv: threshold for rejecting artifacts (in µV)
+    # Output: maximum HEP waveform (1D array of length corresponding to tmin-tmax) in µV
+    # The output is therefore a waveform, not a scalar.
 
+    # Read the epoch start time and convert to sample index.
     t0 = epoch["t0_s"]
-    a = int(t0 * sf)
+    a = int(t0 * sf) # convert epoch start time from seconds to sample index in the full EEG signal
 
+    # Get the R-peaks for the epoch and align them to the global EEG timeline.
     rpeaks = epoch["rpeaks"]
+    # If no R-peaks or only one R-peak is found, we cannot compute HEP, so return None.
     if rpeaks is None or len(rpeaks) < 2:
         return None
 
-    rpeaks_global = np.array(rpeaks) + a
+    rpeaks_global = np.array(rpeaks) + a # convert relative R-peak indices to global sample indices in the full EEG signal
 
-    rr_intervals = np.diff(rpeaks_global)
-    min_rr_samples = int(min_rr_s * sf)
-    amplitude_threshold = amplitude_threshold_uv * 1e-6
+    rr_intervals = np.diff(rpeaks_global) # compute RR intervals in samples to identify and exclude overlapping beats
+    min_rr_samples = int(min_rr_s * sf) # convert minimum RR interval from seconds to samples
+    amplitude_threshold = amplitude_threshold_uv * 1e-6 # convert amplitude threshold from µV to V for comparison with the EEG signal
 
     segments = []
 
     for i, r in enumerate(rpeaks_global):
-
+        
+        # Extract EEG segment around the R-peak (from tmin to tmax)
         seg_start = int(r + tmin * sf)
         seg_stop  = int(r + tmax * sf)
 
+        # Check if the segment is within the bounds of the EEG signal
         if seg_start < 0 or seg_stop > len(eeg_filtered):
             continue
-
+        
+        # Skip beats followed by a very short RR interval to reduce overlap between consecutive heartbeat-locked EEG responses.
         if i < len(rr_intervals):
             if rr_intervals[i] < min_rr_samples:
                 continue
-
+        
+        # Extract the segment of the EEG signal around the R-peak
         segment = eeg_filtered[seg_start:seg_stop]
 
+        # Reject segments dominated by large EEG artifacts.
         if np.max(np.abs(segment)) > amplitude_threshold:
             continue
 
-        segment = detrend(segment)
+        segment = detrend(segment) # Remove slow linear drift within the extracted segment.
 
-        r_idx = int(abs(tmin) * sf)
-        baseline = segment[:r_idx].mean()
-        segment = segment - baseline
+        # Baseline correction using the pre-R interval (-200 ms to 0 ms).
+        r_idx = int(abs(tmin) * sf) # index corresponding to the R-peak in the segment (102 samples if tmin=-0.2s and sf=512Hz)
+        baseline = segment[:r_idx].mean() # mean of the pre-R interval to use as baseline
+        segment = segment - baseline # baseline correction by subtracting the baseline from the entire segment
 
         segments.append(segment)
 
-    if len(segments) == 0:
+    if len(segments) == 0: # if no valid segments were found, we cannot compute a maximum waveform, so
         return None
 
     segments = np.array(segments)  # shape (n_beats, 410)
 
-    # 🔴 MÁXIMO por sample (across beats)
+    # maximum across beats (across rows) to get the maximum HEP waveform for the epoch
     hep_max = np.max(segments, axis=0)  # shape (410,)
 
     return hep_max * 1e6  # µV
@@ -1134,20 +1296,30 @@ def hep_waveform_max(eeg_filtered, epoch, sf,
     # create waveform plot 
     
 def plot_epoch_hep_eeg_hr(eeg_filtered,ecg_epoch, sf, hep_waveform):
+    # Plot the EEG signal, HEP waveform, and heart rate for a single epoch.
+    # Input:
+        # eeg_filtered : full EEG signal (1D, Volts)
+        # ecg_epoch : row containing t0_s, t1_s, rpeaks
+        # sf : sampling frequency (Hz)
+        # hep_waveform : 1D array of HEP values across the time window around R-peaks (in µV)
+    
+    # Output: a plot showing the EEG signal, HEP waveform, and heart rate for the specified epoch
 
+    # Extract epoch timing and convert to sample indices
     t0 = ecg_epoch["t0_s"]
     t1 = ecg_epoch["t1_s"]
 
+    # convert epoch start and end times from seconds to sample indices
     a, b = int(t0 * sf), int(t1 * sf)
 
     # --- EEG ---
-    eeg = eeg_filtered[a:b] * 1e6
-    time = np.arange(a, b) / sf
+    eeg = eeg_filtered[a:b] * 1e6 # convert EEG from Volts to µV for plotting
+    time = np.arange(a, b) / sf # time vector in seconds for the EEG segment of the epoch
 
     # --- R-peaks (convert relative → global) ---
-    if ecg_epoch is not None and "rpeaks" in ecg_epoch:
-        rpeaks_global = np.array(ecg_epoch["rpeaks"]) + a
-        rpeaks = rpeaks_global[(rpeaks_global >= a) & (rpeaks_global < b)]
+    if ecg_epoch is not None and "rpeaks" in ecg_epoch: # if rpeaks are available for the epoch, convert them from relative to global sample indices
+        rpeaks_global = np.array(ecg_epoch["rpeaks"]) + a # convert relative R-peak indices to global sample indices in the full EEG signal
+        rpeaks = rpeaks_global[(rpeaks_global >= a) & (rpeaks_global < b)] # filter R-peaks to include only those that fall within the epoch's time range
     else:
         rpeaks = np.array([])
 
@@ -1169,10 +1341,6 @@ def plot_epoch_hep_eeg_hr(eeg_filtered,ecg_epoch, sf, hep_waveform):
     axs[0].set_title(f"Epoch {t0:.1f}s – {t1:.1f}s")
     axs[0].legend()
 
-    # -------- HEART RATE --------
-    #if not np.isnan(hr):
-     #   axs[1].hlines(hr, t0, t1)
-    #axs[1].set_ylabel("HR (bpm)")
 
     # -------- HEP waveform --------
     if hep_waveform is not None:
