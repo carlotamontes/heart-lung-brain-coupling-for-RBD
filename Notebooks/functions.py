@@ -13,6 +13,94 @@ from scipy.signal import butter, detrend, freqs, welch
 from scipy.signal import coherence, csd
 from scipy.stats import pearsonr, spearmanr
 
+CAP_HYPNOGRAM_COLUMNS = [
+    "Sleep Stage",
+    "Position",
+    "Time [hh:mm:ss]",
+    "Event",
+    "Duration[s]",
+    "Location",
+]
+
+DEFAULT_EEG_CHANNELS = ("F4-C4",)
+DEFAULT_ECG_CHANNELS = ("ECG1-ECG2", "ECG", "ekg", "EKG")
+
+
+def _normalize_cap_hypnogram_columns(columns):
+    normalized = []
+    for column in columns:
+        clean = str(column).replace("\ufeff", "").strip()
+        clean = clean.replace("Duration [s]", "Duration[s]")
+        clean = clean.replace("Time[hh:mm:ss]", "Time [hh:mm:ss]")
+        normalized.append(clean)
+    return normalized
+
+
+def load_cap_hypnogram(txt_path):
+    # Load CAP hypnograms with either the 5-column or 6-column export layout.
+    txt_path = Path(txt_path)
+
+    with txt_path.open("r", encoding="utf-8", errors="replace") as handle:
+        header_idx = next(
+            (idx for idx, line in enumerate(handle) if line.replace("\ufeff", "").startswith("Sleep Stage")),
+            None,
+        )
+
+    if header_idx is None:
+        raise ValueError(f"Could not locate CAP hypnogram header in: {txt_path}")
+
+    df = pd.read_csv(
+        txt_path,
+        sep="\t",
+        skiprows=header_idx,
+        header=0,
+        dtype=str,
+        encoding="utf-8",
+        encoding_errors="replace",
+    )
+    df.columns = _normalize_cap_hypnogram_columns(df.columns)
+
+    if "Position" not in df.columns:
+        df.insert(1, "Position", "")
+
+    for column in CAP_HYPNOGRAM_COLUMNS:
+        if column not in df.columns:
+            df[column] = ""
+
+    df = df.loc[:, CAP_HYPNOGRAM_COLUMNS].copy()
+
+    for column in df.columns:
+        if df[column].dtype == object:
+            df[column] = df[column].fillna("").astype(str).str.strip()
+
+    df["Duration[s]"] = pd.to_numeric(df["Duration[s]"], errors="coerce")
+    return df
+
+
+def _first_matching_channel(raw, candidates):
+    by_casefold = {name.casefold(): name for name in raw.ch_names}
+    for candidate in candidates:
+        matched = by_casefold.get(candidate.casefold())
+        if matched is not None:
+            return matched
+    return None
+
+
+def get_core_channel_names(raw, eeg_candidates=DEFAULT_EEG_CHANNELS, ecg_candidates=DEFAULT_ECG_CHANNELS):
+    eeg_name = _first_matching_channel(raw, eeg_candidates)
+    ecg_name = _first_matching_channel(raw, ecg_candidates)
+
+    missing = []
+    if eeg_name is None:
+        missing.append(f"EEG ({', '.join(eeg_candidates)})")
+    if ecg_name is None:
+        missing.append(f"ECG ({', '.join(ecg_candidates)})")
+
+    if missing:
+        raise ValueError(f"Missing required channels: {missing}")
+
+    return eeg_name, ecg_name
+
 
 def compute_stage_epochs(df, stage_label):
     # extract time intervals (t0, t1) for a given sleep stage.
@@ -79,9 +167,20 @@ def prepare_sleep_stage_dataframe(df, epoch_len, raw_duration_s=None,
     return df
 
 def pick_core_channels(raw):
-    # select only the core channels (F4-C4 for EEG and ECG1-ECG2 for ECG) for further analysis
-    core_chs = ["F4-C4", "ECG1-ECG2"]
-    return raw.copy().pick(core_chs)
+    # Select the core EEG channel plus the first ECG alias that is available.
+    eeg_name, ecg_name = get_core_channel_names(raw)
+    core = raw.copy().pick([eeg_name, ecg_name])
+
+    rename_map = {}
+    if eeg_name != "F4-C4":
+        rename_map[eeg_name] = "F4-C4"
+    if ecg_name != "ECG1-ECG2":
+        rename_map[ecg_name] = "ECG1-ECG2"
+
+    if rename_map:
+        core.rename_channels(rename_map)
+
+    return core
 
 def preprocess_eeg(raw, notch_freqs=(50, 100), l_freq=0.3, h_freq=35.0):
     # Preprocess EEG signal
@@ -91,12 +190,16 @@ def preprocess_eeg(raw, notch_freqs=(50, 100), l_freq=0.3, h_freq=35.0):
     # output: 1D numpy array of the preprocessed EEG signal for the F4-C4 channel
     # Note -> the output is in Volts (V) since MNE reads EEG data in V
 
+    eeg_name, _ = get_core_channel_names(raw)
+
     eeg = raw.copy()
-    eeg = eeg.pick(["F4-C4"])  # pick only the EEG channel for preprocessing
+    eeg = eeg.pick([eeg_name])  # pick only the EEG channel for preprocessing
     if notch_freqs is not None:
-        # Notch filter at 50 and 100 Hz
-        # Remove power line noise
-        eeg.notch_filter(notch_freqs, fir_design='firwin', verbose=False)
+        # Keep notch frequencies safely below Nyquist for lower-rate recordings.
+        nyquist = eeg.info["sfreq"] / 2.0
+        valid_notch_freqs = [freq for freq in notch_freqs if freq < (nyquist - 1.0)]
+        if valid_notch_freqs:
+            eeg.notch_filter(valid_notch_freqs, fir_design='firwin', verbose=False)
 
     #Bandpass 0.3–35 Hz
     eeg.filter(l_freq=l_freq, h_freq=h_freq, verbose=False)
@@ -109,8 +212,10 @@ def preprocess_ecg(raw, method="neurokit", lowcut=0.5, highcut=45):
     # 2. apply bandpass filter from 0.5 to 45 Hz using NeuroKit2's ecg_clean function
     # output: 1D numpy array of the preprocessed ECG signal for the ECG1-ECG2 channel
 
+    _, ecg_name = get_core_channel_names(raw)
+
     sf = raw.info["sfreq"] # sampling frequency
-    ecg = raw.get_data(picks="ECG1-ECG2")[0]
+    ecg = raw.get_data(picks=ecg_name)[0]
 
     # Clean using NeuroKit2's ecg_clean function 
     # Bandpass 0.5–45 Hz
@@ -610,14 +715,12 @@ def hep_metric(eeg_filtered, epoch, sf, window_s=1.0, min_rr_s=0.80,
             # high-amplitude artifacts
         # d. Detrend signal
         # e. Baseline correction (-200ms to 0ms)
-        # f. Compute the peak absolute amplitude for each valid beat
-        # g. Reduce to one scalar as the mean of those per-beat peak amplitudes
+        # f. Compute the mean waveform across valid beats
+        # g. Reduce to one scalar as the peak of that mean waveform
     
     # HEP reflects cortical processing of cardiac signals:
     # higher amplitude → stronger brain–heart interaction
     # modulated by attention, sleep stage, autonomic state
-    # Using absolute peak amplitude makes positive and negative deflections
-    # contribute symmetrically to the final scalar.
 
     # epoch = ecg_R.iloc[1]
     tmin, tmax = -0.2, 0.6
@@ -675,8 +778,8 @@ def hep_metric(eeg_filtered, epoch, sf, window_s=1.0, min_rr_s=0.80,
             hep_values_scalar.append(np.nan)
             continue
         
-        # store one peak-absolute-amplitude value per valid beat in the window
-        hep_peak_amps = []
+        # store valid heartbeat-locked EEG segments for this window
+        segments = []
         # 0.6 -(-0.2) = 0.8 -> 0.8 * 512 = 410
     
         # r is relative to the epoch start
@@ -707,32 +810,32 @@ def hep_metric(eeg_filtered, epoch, sf, window_s=1.0, min_rr_s=0.80,
                         continue  
 
             # extract the segment of the EEG of -200 ms to +500 ms
-            segment = eeg_filtered[seg_start:seg_stop][None, :] # shape (1, segment_samples)
+            segment = eeg_filtered[seg_start:seg_stop]
             
             # amplitude check to exclude artifacts
             if np.max(np.abs(segment)) > amplitude_threshold:
                 continue
 
             # remove linear trends that could bias the average
-            segment = detrend(segment, axis=1)  # axis=1 = along time
+            segment = detrend(segment)
 
             # Baseline correction using the pre-R interval (-200 ms to 0 ms).
             r_idx = int(abs(tmin) * sf)
-            baseline = segment[:, :r_idx].mean(axis=1, keepdims=True)
+            baseline = segment[:r_idx].mean()
             segment = segment - baseline
-            
-            # Use the largest absolute deflection so positive and negative
-            # HEP components are treated the same way.
-            peak_amp = np.max(np.abs(segment))
-            hep_peak_amps.append(float(peak_amp))
+
+            segments.append(segment)
 
         # if all rpeaks on the 1 s window are discarded then discard the window
-        if len(hep_peak_amps) == 0:
+        if len(segments) == 0:
             hep_values_scalar.append(np.nan)
             continue
 
-        # Final 1 s value: mean of per-beat peak absolute amplitudes.
-        hep_values_scalar.append(float(np.mean(hep_peak_amps)) * 1e6)
+        segments = np.array(segments)  # shape (n_beats, 410)
+        mean_waveform = np.mean(segments, axis=0)  # shape (410,)
+
+        # Final 1 s value: peak of the mean waveform.
+        hep_values_scalar.append(float(np.max(mean_waveform)) * 1e6)
 
     return hep_values_scalar # list of floats (µV)
 
@@ -1014,8 +1117,8 @@ def hep_metric_30s(eeg_filtered, epoch, sf, min_rr_s=0.80,
     # 2. Extract EEG segments around each R-peak (-200 ms to +600 ms).
     # 3. Reject beats with short RR intervals or large-amplitude artifacts.
     # 4. Detrend and baseline-correct each segment.
-    # 5. Compute the peak absolute amplitude for each valid beat.
-    # 6. Reduce to one scalar as the mean of those per-beat peak amplitudes.
+    # 5. Compute the mean waveform across valid beats.
+    # 6. Reduce to one scalar as the peak of that mean waveform.
 
     # inputs:
         # eeg_filtered : full EEG signal (1D, Volts)
@@ -1057,7 +1160,7 @@ def hep_metric_30s(eeg_filtered, epoch, sf, min_rr_s=0.80,
     # convert amplitude threshold from µV to V for comparison with the EEG signal
     amplitude_threshold = amplitude_threshold_uv * 1e-6
 
-    hep_peak_amps = [] # to store the peak absolute amplitude of each valid beat in the epoch
+    segments = [] # to store the valid EEG segments around each R-peak
 
     for i, r in enumerate(rpeaks_global):
         # Extract EEG segment around the R-peak (from tmin to tmax)
@@ -1075,30 +1178,30 @@ def hep_metric_30s(eeg_filtered, epoch, sf, min_rr_s=0.80,
                 continue
         
         # Extract the segment of the EEG signal around the R-peak
-        segment = eeg_filtered[seg_start:seg_stop][None, :]
+        segment = eeg_filtered[seg_start:seg_stop]
 
         # Reject segments dominated by large EEG artifacts.
         if np.max(np.abs(segment)) > amplitude_threshold:
             continue
 
         # Remove slow linear drift within the extracted segment.
-        segment = detrend(segment, axis=1)
+        segment = detrend(segment)
 
         # Baseline correction using the pre-R interval (-200 ms to 0 ms).
         r_idx = int(abs(tmin) * sf)
-        baseline = segment[:, :r_idx].mean(axis=1, keepdims=True)
+        baseline = segment[:r_idx].mean()
         segment = segment - baseline
 
-        # Use the largest absolute deflection so positive and negative
-        # HEP components contribute symmetrically.
-        peak_amp = np.max(np.abs(segment))
-        hep_peak_amps.append(float(peak_amp))
+        segments.append(segment)
 
-    if len(hep_peak_amps) == 0:
+    if len(segments) == 0:
         return np.nan
 
-    # Final 30 s value: mean of per-beat peak absolute amplitudes.
-    return float(np.mean(hep_peak_amps)) * 1e6
+    segments = np.array(segments)  # shape (n_beats, 410)
+    mean_waveform = np.mean(segments, axis=0)  # shape (410,)
+
+    # Final 30 s value: peak of the mean waveform.
+    return float(np.max(mean_waveform)) * 1e6
 
 def delta_power_30s(eeg_filtered, epoch, sf):
 
@@ -1150,6 +1253,13 @@ def delta_power_30s(eeg_filtered, epoch, sf):
 # each value of the 410 arrat will be the mean of all the samples of the 40 peaks
 # for sample[1] we do the mean of the 40 sample [1] we got from the 40 r peaks 
 
+def hep_waveform_time_axis(sf, tmin=-0.2, tmax=0.6):
+    # Match the discrete time axis to the integer-casted sample slicing used
+    # when extracting heartbeat-locked EEG segments.
+    start_offset = int(tmin * sf)
+    stop_offset = int(tmax * sf)
+    return np.arange(start_offset, stop_offset, dtype=float) / sf
+
 def hep_waveform_mean(eeg_filtered, epoch, sf, tmin=-0.2, tmax=0.6,  min_rr_s=0.88, amplitude_threshold_uv=100.0):
 
     # Compute the average HEP waveform across all valid heartbeats within a 30-second epoch.
@@ -1162,6 +1272,9 @@ def hep_waveform_mean(eeg_filtered, epoch, sf, tmin=-0.2, tmax=0.6,  min_rr_s=0.
         # amplitude_threshold_uv: threshold for rejecting artifacts (in µV)
     # Output: average HEP waveform (1D array of length corresponding to tmin-tmax) in µV
     # The output is therefore a waveform, not a scalar.
+
+    hep_time = hep_waveform_time_axis(sf=sf, tmin=tmin, tmax=tmax)
+    segment_len = len(hep_time)
 
     # Read the epoch start time and convert to sample index.
     t0 = epoch["t0_s"]
@@ -1185,7 +1298,7 @@ def hep_waveform_mean(eeg_filtered, epoch, sf, tmin=-0.2, tmax=0.6,  min_rr_s=0.
     for i, r in enumerate(rpeaks_global):
         # Extract EEG segment around the R-peak (from tmin to tmax)
         seg_start = int(r + tmin * sf)
-        seg_stop  = int(r + tmax * sf)
+        seg_stop  = seg_start + segment_len
 
         # Check if the segment is within the bounds of the EEG signal
         if seg_start < 0 or seg_stop > len(eeg_filtered):
@@ -1234,6 +1347,9 @@ def hep_waveform_max(eeg_filtered, epoch, sf, tmin=-0.2, tmax=0.6, min_rr_s=0.88
     # Output: maximum HEP waveform (1D array of length corresponding to tmin-tmax) in µV
     # The output is therefore a waveform, not a scalar.
 
+    hep_time = hep_waveform_time_axis(sf=sf, tmin=tmin, tmax=tmax)
+    segment_len = len(hep_time)
+
     # Read the epoch start time and convert to sample index.
     t0 = epoch["t0_s"]
     a = int(t0 * sf) # convert epoch start time from seconds to sample index in the full EEG signal
@@ -1256,7 +1372,7 @@ def hep_waveform_max(eeg_filtered, epoch, sf, tmin=-0.2, tmax=0.6, min_rr_s=0.88
         
         # Extract EEG segment around the R-peak (from tmin to tmax)
         seg_start = int(r + tmin * sf)
-        seg_stop  = int(r + tmax * sf)
+        seg_stop  = seg_start + segment_len
 
         # Check if the segment is within the bounds of the EEG signal
         if seg_start < 0 or seg_stop > len(eeg_filtered):

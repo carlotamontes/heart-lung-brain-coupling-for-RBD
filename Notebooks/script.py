@@ -1,6 +1,6 @@
 # Create a Script to create HDF5 files and two CSV file for every patient 
-# Controls: n01, n02, n03, n04, n05, n09, n10, n11, ins1, ins2, ins3, ins4, ins5, ins6, ins7, ins8, ins9
-# RBD patients: rbd02, rbd03, rbd05, rbd07, rbd08, rbd09, rbd10, rbd11, rbd12, rbd13, rbd17, rbd18, rbd19, rbd21, rbd22
+# Controls: n1, n2, n3, n4, n5, n9, n10, n11, ins1, ins2, ins3, ins4, ins5, ins6, ins7, ins8, ins9
+# RBD patients: rbd2, rbd3, rbd5, rbd7, rbd8, rbd9, rbd10, rbd11, rbd12, rbd13, rbd17, rbd18, rbd19, rbd21, rbd22
 
 # CSV File should have the following columns:
     # Patient ID
@@ -185,6 +185,7 @@ from functions import (
     preprocess_eeg,
     hep_waveform_mean,
     hep_waveform_max,
+    hep_waveform_time_axis,
 )
 
 
@@ -289,6 +290,26 @@ def process_patient_to_hdf5(
 
     print("BP DF length:", len(bp_df))
 
+    # Summary accumulators for patient-level HEP waveform metrics.
+    nrem_stages = {"N1", "N2", "N3"}
+    n_epochs_all = len(epochs)
+    n_epochs_rem = sum(stage == "REM" for stage in sleep_stages)
+    n_epochs_nrem = sum(stage in nrem_stages for stage in sleep_stages)
+    n_valid_hep_epochs = 0
+
+    tmin = -0.2
+    tmax = 0.6
+    hep_time = hep_waveform_time_axis(sf=sf, tmin=tmin, tmax=tmax)
+
+    hep_mean_all = []
+    hep_mean_rem = []
+    hep_mean_nrem = []
+    hep_30s_all = []
+    delta_30s_all = []
+    hep_30s_rem = []
+    delta_30s_rem = []
+    hep_30s_nrem = []
+    delta_30s_nrem = []
 
     # 6. CREATE HDF5
     with h5py.File(h5_path, "w") as f:
@@ -394,18 +415,28 @@ def process_patient_to_hdf5(
                 hep_group.create_dataset("hep_30s", data=hep_30s if hep_30s is not None else np.nan)
                 hep_group.create_dataset("delta_30s", data=delta_30s if delta_30s is not None else np.nan)
 
+                hep_30s_value = float(hep_30s) if hep_30s is not None and np.isfinite(hep_30s) else np.nan
+                delta_30s_value = float(delta_30s) if delta_30s is not None and np.isfinite(delta_30s) else np.nan
+
+                hep_30s_all.append(hep_30s_value)
+                delta_30s_all.append(delta_30s_value)
+
+                if stage == "REM":
+                    hep_30s_rem.append(hep_30s_value)
+                    delta_30s_rem.append(delta_30s_value)
+                elif stage in nrem_stages:
+                    hep_30s_nrem.append(hep_30s_value)
+                    delta_30s_nrem.append(delta_30s_value)
+
+                if hep_30s is not None and np.isfinite(hep_30s):
+                    n_valid_hep_epochs += 1
+
             except Exception as e:
                 print(f"[HEP] Epoch {i} failed: {e}")
             
             # ---- HEP WAVEFORMS ----
             try:
                 wf_group = ep_group.create_group("waveform")
-
-                # Time axis (same for all)
-                tmin = -0.2
-                tmax = 0.6
-                n_samples = int((tmax - tmin) * sf)
-                time = np.linspace(tmin, tmax, n_samples, endpoint=False)
 
                 # ---- MEAN waveform ----
                 hep_mean = hep_waveform_mean(eeg_filtered, ecg_epoch, sf=sf)
@@ -414,10 +445,18 @@ def process_patient_to_hdf5(
 
                 if hep_mean is not None:
                     mean_group.create_dataset("signal", data=hep_mean)
-                    mean_group.create_dataset("time", data=time)
+                    mean_group.create_dataset("time", data=hep_time)
+
+                    hep_mean_array = np.asarray(hep_mean, dtype=float)
+                    if np.all(np.isfinite(hep_mean_array)):
+                        hep_mean_all.append(hep_mean_array)
+                        if stage == "REM":
+                            hep_mean_rem.append(hep_mean_array)
+                        elif stage in nrem_stages:
+                            hep_mean_nrem.append(hep_mean_array)
                 else:
-                    mean_group.create_dataset("signal", data=np.full(len(time), np.nan))
-                    mean_group.create_dataset("time", data=time)
+                    mean_group.create_dataset("signal", data=np.full(len(hep_time), np.nan))
+                    mean_group.create_dataset("time", data=hep_time)
 
                 # ---- MAX waveform ----
                 hep_max = hep_waveform_max(eeg_filtered, ecg_epoch, sf=sf)
@@ -426,12 +465,115 @@ def process_patient_to_hdf5(
 
                 if hep_max is not None:
                     max_group.create_dataset("signal", data=hep_max)
-                    max_group.create_dataset("time", data=time)
+                    max_group.create_dataset("time", data=hep_time)
                 else:
-                    max_group.create_dataset("signal", data=np.full(len(time), np.nan))
-                    max_group.create_dataset("time", data=time)
+                    max_group.create_dataset("signal", data=np.full(len(hep_time), np.nan))
+                    max_group.create_dataset("time", data=hep_time)
 
             except Exception as e:
                 print(f"[Waveform] Epoch {i} failed: {e}")
+
+        # ---- PATIENT-LEVEL SUMMARY ----
+        patient_group.create_dataset("n_epochs_all", data=n_epochs_all)
+        patient_group.create_dataset("n_epochs_rem", data=n_epochs_rem)
+        patient_group.create_dataset("n_epochs_nrem", data=n_epochs_nrem)
+        patient_group.create_dataset("n_valid_hep_epochs", data=n_valid_hep_epochs)
+        patient_group.create_dataset("mean_delta_power_all", data=float(np.nanmean(delta_30s_all)) if len(delta_30s_all) > 0 and np.isfinite(delta_30s_all).any() else np.nan)
+        patient_group.create_dataset("mean_delta_power_REM", data=float(np.nanmean(delta_30s_rem)) if len(delta_30s_rem) > 0 and np.isfinite(delta_30s_rem).any() else np.nan)
+        patient_group.create_dataset("mean_delta_power_NREM", data=float(np.nanmean(delta_30s_nrem)) if len(delta_30s_nrem) > 0 and np.isfinite(delta_30s_nrem).any() else np.nan)
+        patient_group.create_dataset("mean_hep_all", data=float(np.nanmean(hep_30s_all)) if len(hep_30s_all) > 0 and np.isfinite(hep_30s_all).any() else np.nan)
+        patient_group.create_dataset("mean_hep_REM", data=float(np.nanmean(hep_30s_rem)) if len(hep_30s_rem) > 0 and np.isfinite(hep_30s_rem).any() else np.nan)
+        patient_group.create_dataset("mean_hep_NREM", data=float(np.nanmean(hep_30s_nrem)) if len(hep_30s_nrem) > 0 and np.isfinite(hep_30s_nrem).any() else np.nan)
+
+        hep_waveform_group = patient_group.create_group("hep_waveform_derived")
+        hep_waveform_group.create_dataset("time", data=hep_time)
+
+        waveform_mean_all = np.mean(np.vstack(hep_mean_all), axis=0) if hep_mean_all else np.full(len(hep_time), np.nan)
+        waveform_mean_rem = np.mean(np.vstack(hep_mean_rem), axis=0) if hep_mean_rem else np.full(len(hep_time), np.nan)
+        waveform_mean_nrem = np.mean(np.vstack(hep_mean_nrem), axis=0) if hep_mean_nrem else np.full(len(hep_time), np.nan)
+
+        hep_waveform_group.create_dataset("hep_waveform_mean_all", data=waveform_mean_all)
+        hep_waveform_group.create_dataset("hep_waveform_mean_REM", data=waveform_mean_rem)
+        hep_waveform_group.create_dataset("hep_waveform_mean_NREM", data=waveform_mean_nrem)
+
+        # Use the post-R interval only for latency and AUC.
+        post_r_mask = (hep_time >= 0.0) & (hep_time <= 0.6)
+        hep_waveform_group.create_dataset("peak_window_start_s", data=0.0)
+        hep_waveform_group.create_dataset("peak_window_end_s", data=0.6)
+        hep_waveform_group.create_dataset("auc_window_start_s", data=0.0)
+        hep_waveform_group.create_dataset("auc_window_end_s", data=0.6)
+
+        all_wave = waveform_mean_all[post_r_mask]
+        all_time = hep_time[post_r_mask]
+        all_finite = np.isfinite(all_wave)
+        if np.any(all_finite):
+            all_wave_valid = all_wave[all_finite]
+            all_time_valid = all_time[all_finite]
+            hep_peak_latency_all = float(all_time_valid[np.argmax(all_wave_valid)])
+            hep_auc_all = float(np.trapezoid(all_wave_valid, all_time_valid))
+        else:
+            hep_peak_latency_all = np.nan
+            hep_auc_all = np.nan
+
+        rem_wave = waveform_mean_rem[post_r_mask]
+        rem_time = hep_time[post_r_mask]
+        rem_finite = np.isfinite(rem_wave)
+        if np.any(rem_finite):
+            rem_wave_valid = rem_wave[rem_finite]
+            rem_time_valid = rem_time[rem_finite]
+            hep_peak_latency_rem = float(rem_time_valid[np.argmax(rem_wave_valid)])
+            hep_auc_rem = float(np.trapezoid(rem_wave_valid, rem_time_valid))
+        else:
+            hep_peak_latency_rem = np.nan
+            hep_auc_rem = np.nan
+
+        nrem_wave = waveform_mean_nrem[post_r_mask]
+        nrem_time = hep_time[post_r_mask]
+        nrem_finite = np.isfinite(nrem_wave)
+        if np.any(nrem_finite):
+            nrem_wave_valid = nrem_wave[nrem_finite]
+            nrem_time_valid = nrem_time[nrem_finite]
+            hep_peak_latency_nrem = float(nrem_time_valid[np.argmax(nrem_wave_valid)])
+            hep_auc_nrem = float(np.trapezoid(nrem_wave_valid, nrem_time_valid))
+        else:
+            hep_peak_latency_nrem = np.nan
+            hep_auc_nrem = np.nan
+
+        hep_waveform_group.create_dataset("hep_peak_latency_all", data=hep_peak_latency_all)
+        hep_waveform_group.create_dataset("hep_peak_latency_REM", data=hep_peak_latency_rem)
+        hep_waveform_group.create_dataset("hep_peak_latency_NREM", data=hep_peak_latency_nrem)
+        hep_waveform_group.create_dataset("hep_auc_all", data=hep_auc_all)
+        hep_waveform_group.create_dataset("hep_auc_REM", data=hep_auc_rem)
+        hep_waveform_group.create_dataset("hep_auc_NREM", data=hep_auc_nrem)
+
+        corr_group = patient_group.create_group("correlations")
+
+        def compute_epochwise_corr(x_vals, y_vals):
+            x = np.asarray(x_vals, dtype=float)
+            y = np.asarray(y_vals, dtype=float)
+            mask = np.isfinite(x) & np.isfinite(y)
+            if np.sum(mask) < 3:
+                return np.nan, np.nan, np.nan, np.nan
+            pearson_r, pearson_p = pearsonr(x[mask], y[mask])
+            spearman_r, spearman_p = spearmanr(x[mask], y[mask])
+            return float(pearson_r), float(pearson_p), float(spearman_r), float(spearman_p)
+
+        pearson_r, pearson_p, spearman_r, spearman_p = compute_epochwise_corr(hep_30s_all, delta_30s_all)
+        corr_group.create_dataset("pearson_30s_r_all", data=pearson_r)
+        corr_group.create_dataset("pearson_30s_p_all", data=pearson_p)
+        corr_group.create_dataset("spearman_30s_r_all", data=spearman_r)
+        corr_group.create_dataset("spearman_30s_p_all", data=spearman_p)
+
+        pearson_r, pearson_p, spearman_r, spearman_p = compute_epochwise_corr(hep_30s_rem, delta_30s_rem)
+        corr_group.create_dataset("pearson_30s_r_REM", data=pearson_r)
+        corr_group.create_dataset("pearson_30s_p_REM", data=pearson_p)
+        corr_group.create_dataset("spearman_30s_r_REM", data=spearman_r)
+        corr_group.create_dataset("spearman_30s_p_REM", data=spearman_p)
+
+        pearson_r, pearson_p, spearman_r, spearman_p = compute_epochwise_corr(hep_30s_nrem, delta_30s_nrem)
+        corr_group.create_dataset("pearson_30s_r_NREM", data=pearson_r)
+        corr_group.create_dataset("pearson_30s_p_NREM", data=pearson_p)
+        corr_group.create_dataset("spearman_30s_r_NREM", data=spearman_r)
+        corr_group.create_dataset("spearman_30s_p_NREM", data=spearman_p)
 
     print(f"Saved → {h5_path}")
