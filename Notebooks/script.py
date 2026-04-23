@@ -1,5 +1,11 @@
+# power eeg of 30s 
+# overall 
+# per patients (rbd control)
+# per stage (wake, n1, n2, n3, rem)
+# hrv statistic analysis 
+
 # Create a Script to create HDF5 files and two CSV file for every patient 
-# Controls: n1, n2, n3, n4, n5, n9, n10, n11, ins1, ins2, ins3, ins4, ins5, ins6, ins7, ins8, ins9
+# Controls: n1, n2, n3, n5, n10, n11, ins1, ins2, ins3, ins4, ins5, ins6, ins7, ins8, ins9
 # RBD patients: rbd2, rbd3, rbd5, rbd7, rbd8, rbd9, rbd10, rbd11, rbd12, rbd13, rbd17, rbd18, rbd19, rbd21, rbd22
 
 # CSV File should have the following columns:

@@ -102,6 +102,23 @@ def get_core_channel_names(raw, eeg_candidates=DEFAULT_EEG_CHANNELS, ecg_candida
     return eeg_name, ecg_name
 
 
+def _get_epoch_bounds(epoch):
+    # Accept epoch timing either as a pandas row/dict with t0_s and t1_s
+    # or as a plain tuple/list like (t0, t1).
+    if isinstance(epoch, (tuple, list, np.ndarray)) and len(epoch) >= 2:
+        return float(epoch[0]), float(epoch[1])
+
+    if isinstance(epoch, (pd.Series, dict)):
+        return float(epoch["t0_s"]), float(epoch["t1_s"])
+
+    try:
+        return float(epoch["t0_s"]), float(epoch["t1_s"])
+    except Exception as exc:
+        raise TypeError(
+            "epoch must be a row/dict with 't0_s' and 't1_s' or a tuple/list (t0, t1)."
+        ) from exc
+
+
 def compute_stage_epochs(df, stage_label):
     # extract time intervals (t0, t1) for a given sleep stage.
     # input: dataframe with columns "Sleep Stage", "onset_s", "Duration[s]"
@@ -725,8 +742,7 @@ def hep_metric(eeg_filtered, epoch, sf, window_s=1.0, min_rr_s=0.80,
     # epoch = ecg_R.iloc[1]
     tmin, tmax = -0.2, 0.6
 
-    t0 = epoch["t0_s"]
-    t1 = epoch["t1_s"]
+    t0, t1 = _get_epoch_bounds(epoch)
 
     # Convert epoch start and end times from seconds to sample indices
     a, b = int(t0 * sf), int(t1 * sf) 
@@ -923,7 +939,9 @@ def HEP_Delta_plot_one_epoch(hep_values, delta_vals, epoch):
 
     # Output: a plot with two y-axes showing HEP and delta power across the 1-second windows of the epoch
 
-    hep_values = hep_values 
+    hep_values = hep_values
+    t0, t1 = _get_epoch_bounds(epoch)
+    epoch = {"t0_s": t0, "t1_s": t1}
     t = np.arange(len(delta_vals))
 
     fig, ax1 = plt.subplots(figsize=(10,4))
@@ -1035,15 +1053,15 @@ def HEP_EEG_plot_one_epoch(hep_values, eeg_filtered, epoch, sf):
         # sf : sampling frequency (Hz)
     # Output: a plot with two y-axes showing HEP and EEG signal across the 30-second epoch
 
-    hep_values = hep_values 
-    t0 = epoch["t0_s"]
-    t1 = epoch["t1_s"]
+    hep_values = np.atleast_1d(np.asarray(hep_values, dtype=float))
+    t0, t1 = _get_epoch_bounds(epoch)
+    epoch = {"t0_s": t0, "t1_s": t1}
 
     a, b = int(t0 * sf), int(t1 * sf)
     eeg_segment = eeg_filtered[a:b]
 
-    t_eeg = np.linspace(0, 30, len(eeg_segment))
-    t_hep = np.linspace(0, 30, len(hep_values))
+    t_eeg = np.linspace(0, t1 - t0, len(eeg_segment))
+    t_hep = np.linspace(0, t1 - t0, len(hep_values))
 
     fig, ax1 = plt.subplots(figsize=(10,4))
 
@@ -1214,8 +1232,7 @@ def delta_power_30s(eeg_filtered, epoch, sf):
 
 
     # Read the epoch start and end times in seconds.
-    t0 = epoch["t0_s"]
-    t1 = epoch["t1_s"]
+    t0, t1 = _get_epoch_bounds(epoch)
 
     # Convert epoch time limits into sample indices in the full EEG signal.
     a, b = int(t0 * sf), int(t1 * sf)
@@ -1451,7 +1468,7 @@ def plot_epoch_hep_eeg_hr(eeg_filtered,ecg_epoch, sf, hep_waveform):
     if len(rpeaks) > 0:
         axs[0].scatter(rpeaks / sf,
                        eeg_filtered[rpeaks] * 1e6,
-                       s=10, label="R-peaks")
+                       s=10, color="red", label="R-peaks")
 
     axs[0].set_ylabel("EEG (µV)")
     axs[0].set_title(f"Epoch {t0:.1f}s – {t1:.1f}s")
